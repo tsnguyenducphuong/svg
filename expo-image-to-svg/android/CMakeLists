@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(expo-image-to-svg)
+
+# Locate React Native JSI headers
+set(REACT_NATIVE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../node_modules/react-native)
+
+add_library(
+    expo-image-to-svg
+    SHARED
+    src/main/cpp/ExpoImageToSvgModule.cpp
+    src/main/cpp/VTracerEngine.cpp
+)
+
+target_include_directories(
+    expo-image-to-svg
+    PRIVATE
+    src/main/cpp
+    ${REACT_NATIVE_DIR}/ReactCommon/jsi
+)
+
+find_library(log-lib log)
+
+target_link_libraries(
+    expo-image-to-svg
+    ${log-lib}
+)

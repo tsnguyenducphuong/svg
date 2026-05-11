@@ -1,0 +1,66 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+group = 'expo.modules.imagetosvg'
+version = '1.0.0'
+
+// 1. Integration with Expo Modules Core Plugin
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useExpoPublishing()
+
+// 2. Helper for flexible SDK versions
+buildscript {
+    ext.safeExtGet = { prop, fallback ->
+        rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+    }
+}
+
+android {
+    // Unique namespace for your module
+    namespace "expo.modules.imagetosvg"
+    
+    compileSdkVersion safeExtGet("compileSdkVersion", 35)
+
+    defaultConfig {
+        minSdkVersion safeExtGet("minSdkVersion", 23) // Required for JSI/C++
+        targetSdkVersion safeExtGet("targetSdkVersion", 35)
+        versionCode 1
+        versionName "1.0.0"
+
+        // 3. Keep your C++ / CMake configuration
+        externalNativeBuild {
+            cmake {
+                cppFlags "-O3 -frtti -fexceptions -std=c++17"
+                arguments "-DANDROID_STL=c++_shared"
+                // Ensure the NDK builds for the correct architectures
+                abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+            }
+        }
+    }
+
+    // 4. Link to your CMakeLists.txt
+    externalNativeBuild {
+        cmake {
+            path "CMakeLists.txt"
+        }
+    }
+
+    lintOptions {
+        abortOnError false
+    }
+
+    packagingOptions {
+        // Essential for JSI modules to avoid library conflicts
+        pickFirst '**/libexpo-image-to-svg.so'
+        // React Native often provides these; picking first prevents duplicate SO errors
+        pickFirst '**/libc++_shared.so'
+    }
+}
+
+dependencies {
+    // useCoreDependencies() handles expo-modules-core
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:${safeExtGet("kotlinVersion", "1.9.24")}"
+}

@@ -1,0 +1,10 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "expo-image-to-svg": ["../src/index"],
+      "expo-image-to-svg/*": ["../src/*"]
+    }
+  }
+}
