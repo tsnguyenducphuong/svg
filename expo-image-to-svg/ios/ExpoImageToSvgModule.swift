@@ -1,4 +1,6 @@
 import ExpoModulesCore
+import Foundation
+import WebKit
 
 public class ExpoImageToSvgModule: Module {
   // Each module class must implement the definition function. The definition consists of components
@@ -11,9 +13,11 @@ public class ExpoImageToSvgModule: Module {
     Name("ExpoImageToSvg")
 
     OnCreate {
-      // In Expo SDK 50+, the JSI runtime pointer is exposed via jsManager
-      if let jsiRuntimePtr = self.appContext?.jsManager.jsiRuntime {
+      // Correct access for SDK 54: use appContext.runtime
+      if let jsiRuntimePtr = self.appContext?.runtime {
         ExpoImageToSvgJSIInstaller.install(jsiRuntimePtr)
+      } else {
+        print("[ExpoImageToSvg] Error: JSI Runtime pointer is null.")
       }
     }
 

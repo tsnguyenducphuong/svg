@@ -1,6 +1,6 @@
 {
   "name": "expo-image-to-svg",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "description": "Blazing fast expo module to convert image to SVG",
   "main": "build/index.js",
   "types": "build/index.d.ts",
@@ -28,16 +28,23 @@
   "author": "tsnguyenducphuong <ts.nguyenducphuong@gmail.com> (https://github.com/tsnguyenducphuong)",
   "license": "MIT",
   "homepage": "https://github.com/tsnguyenducphuong/svg#readme",
-  "dependencies": {},
   "devDependencies": {
     "@types/react": "~19.1.1",
-    "expo-module-scripts": "^55.0.2",
-    "expo": "^55.0.20",
-    "react-native": "0.82.1"
+    "expo": "^54.0.13",
+    "expo-module-scripts": "^5.0.8",
+    "react-native": "0.81.4",
+    "typescript": "^5.9.3"
   },
   "peerDependencies": {
     "expo": "*",
     "react": "*",
     "react-native": "*"
-  }
+  },
+  "files": [
+    "build",
+    "ios",
+    "android",
+    "cpp",
+    "expo-module.config.json"
+  ]
 }

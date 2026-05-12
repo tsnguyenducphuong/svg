@@ -8,7 +8,7 @@ declare global {
 
 // 1. Load the native module. 
 // This triggers OnCreate/installJSIBindings on the native side.
-const ExpoImageToSvg = requireNativeModule('ExpoImageToSvg');
+requireNativeModule('ExpoImageToSvg');
 
 /**
  * Vectorizes a bitmap buffer into an SVG string synchronously.
@@ -16,14 +16,16 @@ const ExpoImageToSvg = requireNativeModule('ExpoImageToSvg');
  */
 export function vectorize(options: VectorizeOptions): string {
   // Ensure the native side has been initialized
-  if (!global.nativeVectorize) {
+  const nativeFn = globalThis.nativeVectorize;
+
+  if (!nativeFn) {
     throw new Error(
       '[ExpoImageToSvg] Native JSI function not found. Ensure the native module is linked correctly.'
     );
   }
 
   // Pass parameters directly to the C++ engine
-  return global.nativeVectorize({
+  return globalThis.nativeVectorize({
     buffer: options.buffer,
     width: options.width,
     height: options.height,

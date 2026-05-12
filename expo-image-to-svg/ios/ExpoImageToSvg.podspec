@@ -26,13 +26,18 @@ Pod::Spec.new do |s|
     'DEFINES_MODULE' => 'YES',
   }
 
-  s.source_files = "**/*.{h,m,mm,swift,hpp,cpp}"
+  s.source_files = "**/*.{h,m,mm,swift}", "../cpp/**/*.{hpp,cpp}"
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'SWIFT_COMPILATION_MODE' => 'wholemodule',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
     'CLANG_CXX_LIBRARY' => 'libc++',
-    'HEADER_SEARCH_PATHS' => '"$(PODS_ROOT)/Headers/Private/React-Core"'
+    'HEADER_SEARCH_PATHS' => [
+      '"$(PODS_TARGET_SRCROOT)/../cpp"',
+      '"$(PODS_ROOT)/Headers/Public/React-Core"',
+      '"$(PODS_ROOT)/Headers/Public/React-hermes"',
+      '"$(PODS_ROOT)/Headers/Public/React-jsi"'
+    ]
   }
 end

@@ -1,30 +1,30 @@
 import { useEvent } from 'expo';
-import ExpoImageToSvg, { ExpoImageToSvgView } from 'expo-image-to-svg';
+import {vectorize, ExpoImageToSvgView } from 'expo-image-to-svg';
 import { Button, SafeAreaView, ScrollView, Text, View } from 'react-native';
 
 export default function App() {
-  const onChangePayload = useEvent(ExpoImageToSvg, 'onChange');
+  // const onChangePayload = useEvent(ExpoImageToSvg, 'onChange');
 
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView style={styles.container}>
         <Text style={styles.header}>Module API Example</Text>
         <Group name="Constants">
-          <Text>{ExpoImageToSvg.PI}</Text>
+          <Text>'ExpoImageToSvg.PI'</Text>
         </Group>
         <Group name="Functions">
-          <Text>{ExpoImageToSvg.hello()}</Text>
+          <Text>'ExpoImageToSvg.hello()'</Text>
         </Group>
         <Group name="Async functions">
           <Button
             title="Set value"
             onPress={async () => {
-              await ExpoImageToSvg.setValueAsync('Hello from JS!');
+              //await ExpoImageToSvg.setValueAsync('Hello from JS!');
             }}
           />
         </Group>
         <Group name="Events">
-          <Text>{onChangePayload?.value}</Text>
+          <Text>'onChangePayload?.value'</Text>
         </Group>
         <Group name="Views">
           <ExpoImageToSvgView
