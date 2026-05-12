@@ -27,13 +27,28 @@ target_include_directories(
     expo-image-to-svg
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main/cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cpp
     ${PACKAGE_DIR}/cpp
 )
 
 # 5. Link with the Android log library (essential for debugging LOGD)
 find_library(log-lib log)
 
+# 5. Link libraries (Android Log and JS Engine libraries)
+# Important: React Native uses Prefab, so we need to find the ReactAndroid package
+find_package(ReactAndroid REQUIRED CONFIG)
+
 target_link_libraries(
     expo-image-to-svg
     ${log-lib}
+    log
+    ReactAndroid::jsi
+)
+
+# 6. 16KB Page Alignment for Modern Android
+# Ensures compatibility with Android 15+ and specialized devices.
+target_link_options(
+  expo-image-to-svg
+  PRIVATE
+  "-Wl,-z,max-page-size=16384"
 )

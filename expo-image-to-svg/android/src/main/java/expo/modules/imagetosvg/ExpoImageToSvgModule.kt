@@ -28,9 +28,9 @@ class ExpoImageToSvgModule : Module() {
             val reactContext =
                 appContext.reactContext as? ReactApplicationContext ?: return@OnCreate
  
-            val holder = reactContext.javaScriptContextHolder ?: return@OnCreate
+            val holder = reactContext.javaScriptContextHolder ?: return@OnCreate 
             
-            val jsiRuntimePointer: Long = holder.get()
+            val jsiRuntimePointer: Long = holder.get() ?: 0L
             if (jsiRuntimePointer != 0L) {
               installJSIBindings(jsiRuntimePointer)
             }
