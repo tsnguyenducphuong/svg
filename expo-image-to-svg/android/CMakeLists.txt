@@ -9,6 +9,30 @@ set(PACKAGE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Set REACT_NATIVE_DIR — passed in from Gradle, but provide a fallback
+# so CMake can also be invoked standalone during IDE inspection.
+if(NOT DEFINED REACT_NATIVE_DIR)
+    set(REACT_NATIVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../node_modules/react-native")
+endif()
+
+# Explicitly add React Native's Prefab CMake package path.
+# Without this, find_package(ReactAndroid) fails because CMake doesn't
+# know where to look — even with prefab=true in Gradle.
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE NEVER)
+
+file(TO_CMAKE_PATH
+    "${REACT_NATIVE_DIR}/ReactAndroid/build/intermediates/cxx"
+    RN_CXX_DIR
+)
+
+# Add the Prefab package directory to CMAKE_PREFIX_PATH so
+# find_package() can resolve ReactAndroid::jsi
+list(APPEND CMAKE_PREFIX_PATH
+    "${REACT_NATIVE_DIR}/ReactAndroid/build/intermediates/prefab/debug/prefab"
+    "${REACT_NATIVE_DIR}/ReactAndroid/build/intermediates/prefab/release/prefab"
+)
+
+
 # 3. Add the library
 add_library(
     # This name MUST match System.loadLibrary("expo-image-to-svg") in your Kotlin code
@@ -29,6 +53,10 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main/cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../cpp
     ${PACKAGE_DIR}/cpp
+    # Directly include JSI headers as a fallback if Prefab is unavailable
+    "${REACT_NATIVE_DIR}/ReactCommon/jsi"
+    "${REACT_NATIVE_DIR}/ReactCommon"
+    "${REACT_NATIVE_DIR}/ReactAndroid/src/main/jni/react/turbomodule"
 )
 
 # 5. Link with the Android log library (essential for debugging LOGD)
@@ -43,6 +71,7 @@ target_link_libraries(
     ${log-lib}
     log
     ReactAndroid::jsi
+    android
 )
 
 # 6. 16KB Page Alignment for Modern Android

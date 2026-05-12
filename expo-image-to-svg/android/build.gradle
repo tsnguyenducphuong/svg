@@ -2,7 +2,7 @@ apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
 
 group = 'expo.modules.imagetosvg'
-version = '0.2.9'
+version = '0.3.0'
 
 // 1. Integration with Expo Modules Core Plugin
 def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
@@ -28,16 +28,21 @@ android {
         minSdkVersion safeExtGet("minSdkVersion", 23) // Required for JSI/C++
         targetSdkVersion safeExtGet("targetSdkVersion", 35)
         versionCode 1
-        versionName "0.2.9"
+        versionName "0.3.0"
 
         // 3. Keep your C++ / CMake configuration
         externalNativeBuild {
             cmake {
                 cppFlags "-O3 -frtti -fexceptions -std=c++17"
-                arguments "-DANDROID_STL=c++_shared"
+                arguments "-DANDROID_STL=c++_shared","-DREACT_NATIVE_DIR=${projectDir}/../node_modules/react-native"
                 // Ensure the NDK builds for the correct architectures
                 abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
             }
+        }
+
+        //Enable Prefab so CMake can find ReactAndroid package
+        buildFeatures {
+            prefab true
         }
     }
 
