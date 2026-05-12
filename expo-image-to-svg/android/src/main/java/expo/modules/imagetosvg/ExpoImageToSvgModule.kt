@@ -1,75 +1,62 @@
 package expo.modules.imagetosvg
 
+import android.util.Log
+import com.facebook.react.bridge.ReactApplicationContext
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
-import java.net.URL
-import com.facebook.react.bridge.ReactApplicationContext
+import kotlin.math.PI
 
 class ExpoImageToSvgModule : Module() {
 
-  init {
-    try {
-      System.loadLibrary("expo-image-to-svg")
-    } catch (e: UnsatisfiedLinkError) {
-      e.printStackTrace()
-    }
-  }
+    companion object {
+        private const val TAG = "ExpoImageToSvgModule"
 
-  override fun definition() = ModuleDefinition {
-
-    Name("ExpoImageToSvg")
-
-    OnCreate {
-      val reactContext =
-        appContext.reactContext as? ReactApplicationContext
-
-      val catalystInstance = reactContext?.catalystInstance
-
-      if (catalystInstance == null || catalystInstance.isDestroyed) {
-        return@OnCreate
-      }
-
-      val jsiRuntimePointer: Long =
-        catalystInstance
-          .javaScriptContextHolder
-          .get()
-          .toLong()
-
-      if (jsiRuntimePointer != 0L) {
-        installJSIBindings(jsiRuntimePointer)
-      }
+        init {
+            try {
+                System.loadLibrary("expo-image-to-svg")
+            } catch (e: UnsatisfiedLinkError) {
+                Log.e(TAG, "Failed to load native library: ${e.message}")
+            }
+        }
     }
 
-    Constant("PI") {
-      Math.PI
+    override fun definition() = ModuleDefinition {
+        Name("ExpoImageToSvg")
+
+        OnCreate {
+            // FIX: cast to ReactApplicationContext, not ReactContext
+            val reactContext =
+                appContext.reactContext as? ReactApplicationContext ?: return@OnCreate
+ 
+            val holder = reactContext.javaScriptContextHolder ?: return@OnCreate
+            
+            val jsiRuntimePointer: Long = holder.get()
+            if (jsiRuntimePointer != 0L) {
+              installJSIBindings(jsiRuntimePointer)
+            }
+            
+        }
+
+        Constant("PI") { PI }   // FIX: kotlin.math.PI (idiomatic)
+
+        Events("onChange")
+
+        Function("hello") {
+            "Hello world! 👋"
+        }
+
+        AsyncFunction("setValueAsync") { value: String ->
+            sendEvent("onChange", mapOf("value" to value))
+        }
+
+        View(ExpoImageToSvgView::class) {
+            // FIX: use String, not java.net.URL — Expo props don't support URL type
+            Prop("url") { view: ExpoImageToSvgView, url: String ->
+                view.webView.loadUrl(url)
+            }
+            Events("onLoad")
+        }
     }
 
-    Events("onChange")
-
-    Function("hello") {
-      "Hello world! 👋"
-    }
-
-    AsyncFunction("setValueAsync") { value: String ->
-      sendEvent(
-        "onChange",
-        mapOf(
-          "value" to value
-        )
-      )
-    }
-
-    View(ExpoImageToSvgView::class) {
-
-      Prop("url") { view: ExpoImageToSvgView, url: URL ->
-        view.webView.loadUrl(url.toString())
-      }
-
-      Events("onLoad")
-    }
-  }
-
-  private external fun installJSIBindings(
-    jsiRuntimePointer: Long
-  )
+    private external fun installJSIBindings(jsiRuntimePointer: Long)
 }

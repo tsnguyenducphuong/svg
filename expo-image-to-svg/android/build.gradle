@@ -2,7 +2,7 @@ apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
 
 group = 'expo.modules.imagetosvg'
-version = '0.2.2'
+version = '0.2.8'
 
 // 1. Integration with Expo Modules Core Plugin
 def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
@@ -28,7 +28,7 @@ android {
         minSdkVersion safeExtGet("minSdkVersion", 23) // Required for JSI/C++
         targetSdkVersion safeExtGet("targetSdkVersion", 35)
         versionCode 1
-        versionName "0.2.2"
+        versionName "0.2.8"
 
         // 3. Keep your C++ / CMake configuration
         externalNativeBuild {
