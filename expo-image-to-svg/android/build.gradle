@@ -1,73 +1,65 @@
 apply plugin: 'com.android.library'
-apply plugin: 'kotlin-android'
 
 group = 'expo.modules.imagetosvg'
-version = '0.3.0'
+version = '0.6.8'
 
-// 1. Integration with Expo Modules Core Plugin
 def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
 apply from: expoModulesCorePlugin
 applyKotlinExpoModulesCorePlugin()
 useCoreDependencies()
 useExpoPublishing()
 
-// 2. Helper for flexible SDK versions
-buildscript {
+def useManagedAndroidSdkVersions = false
+if (useManagedAndroidSdkVersions) {
+  useDefaultAndroidSdkVersions()
+} else {
+  buildscript {
     ext.safeExtGet = { prop, fallback ->
-        rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+      rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
     }
+  }
+  project.android {
+    compileSdkVersion safeExtGet("compileSdkVersion", 36)
+    defaultConfig {
+      minSdkVersion safeExtGet("minSdkVersion", 24)
+      targetSdkVersion safeExtGet("targetSdkVersion", 36)
+    }
+  }
 }
 
 android {
-    // Unique namespace for your module
-    namespace "expo.modules.imagetosvg"
-    
-    compileSdkVersion safeExtGet("compileSdkVersion", 35)
+  namespace "expo.modules.imagetosvg"
 
-    defaultConfig {
-        minSdkVersion safeExtGet("minSdkVersion", 23) // Required for JSI/C++
-        targetSdkVersion safeExtGet("targetSdkVersion", 35)
-        versionCode 1
-        versionName "0.3.0"
+  buildFeatures {
+    prefab true   // CRITICAL: this is what makes find_package(ReactAndroid) work
+  }
 
-        // 3. Keep your C++ / CMake configuration
-        externalNativeBuild {
-            cmake {
-                cppFlags "-O3 -frtti -fexceptions -std=c++17"
-                arguments "-DANDROID_STL=c++_shared","-DREACT_NATIVE_DIR=${projectDir}/../node_modules/react-native"
-                // Ensure the NDK builds for the correct architectures
-                abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
-            }
-        }
-
-        //Enable Prefab so CMake can find ReactAndroid package
-        buildFeatures {
-            prefab true
-        }
-    }
-
-    // 4. Link to your CMakeLists.txt
+  defaultConfig {
     externalNativeBuild {
-        cmake {
-            path "CMakeLists.txt"
-        }
+      cmake {
+        cppFlags "-std=c++17 -O3 -fexceptions -frtti"
+        arguments "-DANDROID_STL=c++_shared"
+        // No need for -DREACT_NATIVE_DIR when using Prefab
+      }
     }
+  }
 
-    lintOptions {
-        abortOnError false
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
     }
+  }
 
-    packagingOptions {
-        // Essential for JSI modules to avoid library conflicts
-        pickFirst '**/libexpo-image-to-svg.so'
-        // React Native often provides these; picking first prevents duplicate SO errors
-        pickFirst '**/libc++_shared.so'
-    }
+  packagingOptions {
+    pickFirst '**/libc++_shared.so'
+  }
+
+  lintOptions {
+    abortOnError false
+  }
 }
 
 dependencies {
-  implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8"
-  implementation "com.facebook.react:react-android:+"
-  // JSI headers (needed for javaScriptContextHolder / JSI runtime ptr)
-  implementation "com.facebook.react:hermes-android:+"
+  // No version pin — matches the working project exactly
+  implementation "com.facebook.react:react-android"
 }
