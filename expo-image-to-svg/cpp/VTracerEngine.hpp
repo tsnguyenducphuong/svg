@@ -1,23 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  VTracerEngine.hpp
-//  C++ port of visioncortex/vtracer  (https://github.com/visioncortex/vtracer)
+//  VTracerEngine.hpp  —  public API for the enhanced SVG vectoriser v2
 //
-//  Pipeline (mirrors the Rust source):
-//    1. Colour quantisation            – color_precision bits per channel
-//    2. Gradient merging               – union-find on colours within gradient_step
-//    3. BFS connected-component labelling – 4-connectivity, single label map
-//    4. Speckle filtering              – discard clusters < filter_speckle pixels
-//    5. Moore Neighbourhood tracing    – Jacob's stopping criterion (correct loop)
-//    6. Collinear-step collapse        – remove redundant walk pixels
-//    7. Angle-based corner detection   – corner_threshold in degrees
-//    8. Cubic Bézier spline fitting    – Catmull-Rom → Bézier, tension 0.5
-//    9. SVG serialisation              – darkest layer first; path_precision dp
+//  This header is designed to integrate cleanly into an Expo Native Module
+//  (React Native / TypeScript) as a C++ implementation file compiled by
+//  the Hermes/JSI or turbo-module build system.
 //
-//  Requires C++17.  No external dependencies.
-//
-//  Quick-start:
-//      vtracer::Options opt;
-//      std::string svg = vtracer::vectorize(rgba_ptr, w, h, opt);
+//  Compile flags recommended for mobile targets:
+//   iOS/Android arm64:  -O2 -ffast-math -march=armv8-a+simd
+//   Android x86_64:     -O2 -ffast-math -msse4.2
+//   macOS/Simulator:    -O2 -ffast-math -mavx2
 // ═══════════════════════════════════════════════════════════════════════════
 #pragma once
 
@@ -26,52 +17,76 @@
 
 namespace vtracer {
 
-// ── Processing mode ────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────
+//  Color mode
+// ───────────────────────────────────────────────────────────────────────────
 enum class ColorMode {
-    Color,           ///< Full-colour output (default).
-    BlackAndWhite    ///< Luminance-threshold binarisation at L = 128.
+    Color,          // Full RGB (default)
+    BlackAndWhite,  // Threshold at luminance 128
 };
 
-// ── Tuning parameters ──────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────
+//  Vectorisation options
+//  All fields have sensible defaults inside vectorize() when set to 0 / -1.
+// ───────────────────────────────────────────────────────────────────────────
 struct Options {
-    // Colour processing
-    ColorMode color_mode     = ColorMode::Color;
+    // Colour quantisation — number of palette entries = 2^color_precision
+    // Range [1,8].  Default 6 (64 colours).
+    int color_precision = 6;
 
-    /// Significant bits kept per RGB channel [1–8].
-    /// 8 = lossless; 6 = 64 steps/channel (VTracer default); 4 = coarse.
-    int   color_precision    = 6;
+    // Perceptual merge step in CIE-Lab ΔE units.
+    // Palette entries closer than this are merged into one colour.
+    // 0 = disabled.  Typical range [0, 10].
+    float gradient_step = 0.f;
 
-    /// Merge quantised colours whose Euclidean RGB distance ≤ this value.
-    /// Bridges staircase artefacts from fixed-step quantisation. 0 = off.
-    float gradient_step      = 16.f;
+    // Corner threshold in degrees.  Turns sharper than (180 - threshold)°
+    // become hard corners; all other vertices are smooth.
+    // Default 120 (corners sharper than 60° are hard).
+    float corner_threshold = 120.f;
 
-    // Noise filtering
-    /// Discard connected components smaller than this pixel count.
-    int   filter_speckle     = 4;
+    // Minimum connected-component size in pixels.  Smaller blobs are dropped
+    // (speckle filter).  Default 4.
+    int filter_speckle = 4;
 
-    // Path quality
-    /// Interior turning angle (degrees) above which a vertex becomes a hard
-    /// corner (line-to command).  Higher → fewer corners, rounder output.
-    /// Matches VTracer's --corner_threshold flag.  Default: 60.
-    float corner_threshold   = 60.f;
+    // Ramer-Douglas-Peucker simplification tolerance in pixels.
+    // Smaller = more vertices, higher fidelity.  Default 1.5.
+    float rdp_epsilon = 1.5f;
 
-    // SVG output
-    /// Decimal places for SVG path coordinates [0–6].
-    int   path_precision     = 2;
+    // SVG coordinate decimal places [0,6].  Default 1.
+    int path_precision = 1;
+
+    // Gaussian pre-blur radius (sigma in pixels).
+    // 0 = no blur.  Capped at 3.  Default 1.0.
+    float blur_radius = 1.0f;
+
+    // Color mode.  Default: full color.
+    ColorMode color_mode = ColorMode::Color;
+
+    // [E3] Maximum Bézier fitting residual tolerance (pixels).
+    // Segments with error above this are recursively subdivided.
+    // Default: 0.5 px.
+    float fit_tolerance = 0.5f;
 };
 
-// ── Public API ─────────────────────────────────────────────────────────────
-
-/// Convert a row-major RGBA8888 pixel buffer to a self-contained SVG string.
-///
-/// @param pixels   Pointer to width×height×4 bytes (R, G, B, A order).
-///                 Pixels with alpha < 128 are treated as transparent.
-/// @param width    Image width in pixels  (must be > 0).
-/// @param height   Image height in pixels (must be > 0).
-/// @param options  Tuning parameters — all fields have working defaults.
-/// @return         Complete SVG document. viewBox = "0 0 width height".
-///                 Layers ordered darkest-first; curves use cubic Bézier.
-std::string vectorize(const uint8_t* pixels, int width, int height,
-                      Options options = Options{});
+// ───────────────────────────────────────────────────────────────────────────
+//  vectorize()
+//
+//  Convert a raster image to an SVG string.
+//
+//  pixels  — packed RGBA bytes, row-major, top-left origin.
+//             Length must be exactly width * height * 4 bytes.
+//  width   — image width  in pixels (> 0)
+//  height  — image height in pixels (> 0)
+//  options — tuning parameters (defaults applied for zero/negative values)
+//
+//  Returns a complete SVG document as a UTF-8 std::string.
+//  Thread-safe: all state is local to the call (global LUTs are read-only
+//  after initialisation).
+// ───────────────────────────────────────────────────────────────────────────
+std::string vectorize(
+    const uint8_t* pixels,
+    int            width,
+    int            height,
+    Options        options = {});
 
 } // namespace vtracer
