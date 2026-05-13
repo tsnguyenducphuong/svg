@@ -1,9 +1,7 @@
 import { requireNativeModule } from 'expo-modules-core';
 import {
-  VectorizeOptions,
-  NativeBridgeOptions,
-  VECTORIZE_DEFAULTS,
-  toNativeBridgeOptions,
+  VectorizeOptions, 
+  VECTORIZE_DEFAULTS, 
 } from './ExpoImageToSvg.types';
 
 // ---------------------------------------------------------------------------
@@ -12,7 +10,7 @@ import {
 //  the JS global. We declare it here so TypeScript knows the shape.
 // ---------------------------------------------------------------------------
 declare global {
-  var nativeVectorize: (options: NativeBridgeOptions) => string;
+  var nativeVectorize: (options: VectorizeOptions) => string;
 }
 
 // 1. Load the native module.
@@ -58,7 +56,7 @@ export function vectorize(options: VectorizeOptions): string {
 
   // toNativeBridgeOptions applies all defaults, converts the buffer to a
   // plain ArrayBuffer, and flips `threshold` → `cornerThreshold`.
-  return nativeFn(toNativeBridgeOptions(options));
+  return nativeFn(options);
 }
 
 // ---------------------------------------------------------------------------
