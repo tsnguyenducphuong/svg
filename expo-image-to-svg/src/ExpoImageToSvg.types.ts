@@ -177,7 +177,23 @@ export interface VectorizeOptions {
    * Maps to C++: `path_precision`.
    * @default 1
    */
-  pathPrecision?: number;
+  pathPrecision?: number; 
+
+  // Controls edge preservation strength. Higher = more blur across edges.
+  // Typical range: 15 (strong edge preservation) – 50 (soft).
+  /**
+   * @default 30.0
+   */
+  bilateral_sigma_r?: number;
+
+  // ΔE (CIE-Lab) threshold for grouping perceptually similar adjacent
+  // colour regions into a single SVG linearGradient fill.
+  // Set to 0 to disable gradient detection entirely.
+  /**
+   * @default 22.0
+   */ 
+  gradient_detect_thresh?:number;
+
 }
 
 
@@ -195,4 +211,6 @@ export const VECTORIZE_DEFAULTS = {
   fitTolerance:  0.5,
   blurRadius:    1.0,
   pathPrecision: 1,
+  bilateral_sigma_r: 30.0,
+  gradient_detect_thresh: 22.0
 } as const satisfies Partial<VectorizeOptions>;

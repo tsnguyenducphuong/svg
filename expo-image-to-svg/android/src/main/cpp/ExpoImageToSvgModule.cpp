@@ -138,6 +138,14 @@ jsi::Value vectorizeJSI(
         opts.path_precision = (int)params.getProperty(rt, "pathPrecision").asNumber();
     }
 
+    if (params.hasProperty(rt, "bilateral_sigma_r") && params.getProperty(rt, "bilateral_sigma_r").isNumber()) {
+        opts.bilateral_sigma_r = (int)params.getProperty(rt, "bilateral_sigma_r").asNumber();
+    }
+
+    if (params.hasProperty(rt, "gradient_detect_thresh") && params.getProperty(rt, "gradient_detect_thresh").isNumber()) {
+        opts.gradient_detect_thresh = (int)params.getProperty(rt, "gradient_detect_thresh").asNumber();
+    }
+
     // -------------------------------------------------------------------------
     // Execute vectorization engine
     // -------------------------------------------------------------------------
