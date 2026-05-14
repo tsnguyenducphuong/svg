@@ -1,39 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  VTracerEngine.cpp  —  production-grade SVG vectoriser  (Enhanced v2)
-//
-//  Enhancements over v1:
-//   [E1] Shared Topology Management
-//        All inter-colour edges are extracted once into a half-edge graph.
-//        Boundary curves are shared across adjacent colour regions so that
-//        RDP and Bézier fitting are applied to the *same* point samples,
-//        eliminating micro-gaps where background bleeds through.
-//
-//   [E2] LUT-Accelerated Perceptual Pipeline
-//        linearise() and the CIE f(t) function are pre-computed into 256-
-//        and 1024-entry float tables. Nearest-palette search uses the LUT
-//        Lab values. The Gaussian passes are written in a cache-friendly
-//        blocked layout and, when compiled with SSE4.2 or AVX2, process
-//        4–8 floats per cycle via compiler-friendly SIMD intrinsics.
-//
-//   [E3] Constrained Least-Squares Bézier Fitting (Schneider-style)
-//        After RDP the simplified vertices seed an iterative Bézier fit.
-//        Control points are refined to minimise squared distance to the
-//        original high-res boundary, allowing one cubic segment to span
-//        many vertices and dramatically shrinking SVG output size.
-//
-//  Full pipeline:
-//   Stage 0  Gaussian pre-blur          smooths pixel noise before tracing
-//   Stage 1  Median-cut quantisation    perceptually accurate palette
-//   Stage 2  CIE-Lab gradient merge     perceptual colour distance
-//   Stage 3  BFS connected components   4-connectivity per colour
-//   Stage 4  Speckle filter             drop tiny components
-//   Stage 5  Shared topology extraction build half-edge graph once        [E1]
-//   Stage 6  Moore boundary trace       Jacob's stopping criterion
-//   Stage 7  RDP simplification         Ramer-Douglas-Peucker
-//   Stage 8  Corner detection           angle-based per vertex
-//   Stage 9  Constrained LS Bézier fit  Schneider iterative refinement    [E3]
-//   Stage 10 Winding-order fix          CW outer, CCW holes
-//   Stage 11 SVG emission               relative cmds, short hex, <g> groups
+//  VTracerEngine.cpp  —  production-grade SVG vectoriser 
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "VTracerEngine.hpp"
@@ -50,6 +16,28 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <time.h>   // clock_gettime
+
+// ── Logging ─────────────────────────────────────────────────────────────────
+// On Android link with -llog.  On other platforms falls back to stderr.
+#ifdef __ANDROID__
+#  include <android/log.h>
+#  define VT_LOG(fmt, ...)  __android_log_print(ANDROID_LOG_DEBUG, "VTracerEngine", fmt, ##__VA_ARGS__)
+#  define VT_WARN(fmt, ...) __android_log_print(ANDROID_LOG_WARN,  "VTracerEngine", fmt, ##__VA_ARGS__)
+#  define VT_ERR(fmt, ...)  __android_log_print(ANDROID_LOG_ERROR, "VTracerEngine", fmt, ##__VA_ARGS__)
+#else
+#  include <cstdio>
+#  define VT_LOG(fmt, ...)  fprintf(stderr, "[VTracer] "  fmt "\n", ##__VA_ARGS__)
+#  define VT_WARN(fmt, ...) fprintf(stderr, "[VTracer WARN] " fmt "\n", ##__VA_ARGS__)
+#  define VT_ERR(fmt, ...)  fprintf(stderr, "[VTracer ERROR] " fmt "\n", ##__VA_ARGS__)
+#endif
+
+// ── Timing helper ────────────────────────────────────────────────────────────
+static inline double vt_now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 // Optional SIMD — guarded so the file compiles without intrinsics headers
 #if defined(__SSE4_2__)
@@ -74,8 +62,8 @@ static constexpr float kDefaultBlurRadius      = 1.0f;
 static constexpr int   kMaxPaletteSize         = 256;
 
 // Schneider fitting parameters
-static constexpr int   kMaxFitIter             = 8;   // refinement iterations
-static constexpr float kFitTolerance           = 0.5f; // pixels, sq = 0.25
+static constexpr int   kMaxFitIter             = 8;
+static constexpr float kFitTolerance           = 0.5f;
 
 // ───────────────────────────────────────────────────────────────────────────
 //  Geometry types
@@ -135,25 +123,20 @@ static float luminance(uint32_t c) {
 
 // ───────────────────────────────────────────────────────────────────────────
 //  [E2] LUT-accelerated CIE-Lab pipeline
-//  linearise[]  : 256-entry sRGB → linear float table
-//  kLabF[]      : 1024-entry f(t) table covering [0, 1.1] (X,Y,Z/white ≤1.09)
 // ───────────────────────────────────────────────────────────────────────────
 struct LabLUT {
-    float linearise[256];   // sRGB byte → linear float
-    float labF[1024];       // f(t) = t>0.008856 ? cbrt(t) : 7.787*t+16/116
-                            // domain [0,1.1], step = 1.1/1024
+    float linearise[256];
+    float labF[1024];
     static constexpr float kFDomain = 1.1f;
     static constexpr int   kFSize   = 1024;
 
     LabLUT() {
-        // sRGB linearise
         for (int i = 0; i < 256; ++i) {
             float u = (float)i / 255.f;
             linearise[i] = (u <= 0.04045f)
                 ? u / 12.92f
                 : std::pow((u + 0.055f) / 1.055f, 2.4f);
         }
-        // CIE f(t)
         for (int i = 0; i < kFSize; ++i) {
             float t = kFDomain * (float)i / (float)kFSize;
             labF[i] = (t > 0.008856f)
@@ -168,7 +151,7 @@ struct LabLUT {
         if (idx >= kFSize) idx = kFSize - 1;
         return labF[idx];
     }
-} g_lut;  // Single global instance initialised at startup
+} g_lut;
 
 struct Lab { float L, a, b; };
 
@@ -192,11 +175,6 @@ static float labDistSq(uint32_t a, uint32_t b) {
 
 // ───────────────────────────────────────────────────────────────────────────
 //  [E2] Stage 0 — SIMD-friendly Separable Gaussian pre-blur
-//
-//  The inner convolution loop is written so auto-vectorisers (and explicit
-//  SSE/AVX paths) can process 4 or 8 floats per iteration.  For mobile
-//  ARM targets the same loop auto-vectorises with NEON via clang -O2.
-//  sigma=0 → passthrough copy only.
 // ───────────────────────────────────────────────────────────────────────────
 static std::vector<uint8_t> gaussianBlur(
     const uint8_t* src, int W, int H, float sigma)
@@ -218,26 +196,16 @@ static std::vector<uint8_t> gaussianBlur(
     for (float& k : kern) k /= ksum;
 
     const int N = W * H;
-    // Interleaved RGBA floats — cache-friendly for SIMD
     std::vector<float>   tmp(N*4, 0.f);
     std::vector<uint8_t> dst(N*4);
 
-    // ── Horizontal pass ───────────────────────────────────────────────────
-    // For each row we gather reflected-border samples into a contiguous
-    // scratch buffer so the inner loop is pure stride-1 (SIMD-friendly).
+    // Horizontal pass
     std::vector<float> row_scratch((W + 2*radius) * 4);
 
     for (int y = 0; y < H; ++y) {
         const uint8_t* srcy = src + y*W*4;
         float* pad = row_scratch.data();
 
-        // fill padded row (reflect border)
-        for (int k = 0; k < ksize; ++k) {
-            int sx = std::clamp(k - radius, 0, W - 1);
-            // pre-fill left fringe relative to x=0
-            (void)sx; // used below per-x
-        }
-        // Expand row into float with border reflection
         for (int px = -radius; px < W + radius; ++px) {
             int sx = std::clamp(px, 0, W-1);
             const uint8_t* p = srcy + sx*4;
@@ -250,8 +218,6 @@ static std::vector<uint8_t> gaussianBlur(
         for (int x = 0; x < W; ++x) {
             float r=0,g=0,b=0,a=0;
             const float* base = pad + x*4;
-            // This loop body is intentionally simple so the compiler can
-            // auto-vectorise it across all 4 channels simultaneously.
             for (int k = 0; k < ksize; ++k) {
                 float w = kern[k];
                 const float* q = base + k*4;
@@ -262,8 +228,7 @@ static std::vector<uint8_t> gaussianBlur(
         }
     }
 
-    // ── Vertical pass (column-major strip for cache) ────────────────────
-    // Process columns in strips of 8 to keep L1 cache hot.
+    // Vertical pass (column-major strip for cache)
     static constexpr int kColStrip = 8;
     std::vector<float> col_scratch((H + 2*radius) * kColStrip * 4);
 
@@ -271,7 +236,6 @@ static std::vector<uint8_t> gaussianBlur(
         int x1 = std::min(x0 + kColStrip, W);
         int ncols = x1 - x0;
 
-        // Expand column strip into col_scratch with border reflection
         for (int py = -radius; py < H + radius; ++py) {
             int sy = std::clamp(py, 0, H-1);
             const float* src_row = tmp.data() + sy*W*4;
@@ -426,18 +390,26 @@ static std::vector<uint32_t> buildPaletteAndAssign(
             freq[packRGB(p[0],p[1],p[2])]++;
         }
     }
-    if (!anyOpaque) return {};
+    if (!anyOpaque) {
+        VT_WARN("buildPaletteAndAssign: image has no opaque pixels (all alpha==0). Returning empty SVG.");
+        return {};
+    }
 
     const int targetSz = std::min(1 << std::clamp(opt.color_precision,1,8),
                                   kMaxPaletteSize);
+    VT_LOG("Stage 1: %d unique colours -> target palette size %d", (int)freq.size(), targetSz);
+
     std::vector<ColorEntry> entries;
     entries.reserve(freq.size());
     for (auto& [c,cnt]:freq) entries.push_back({rgb24(c),cnt});
 
     std::vector<uint32_t> palette = medianCutPalette(entries, targetSz);
-    if (palette.empty()) return {};
+    if (palette.empty()) {
+        VT_WARN("buildPaletteAndAssign: medianCutPalette returned empty palette.");
+        return {};
+    }
+    VT_LOG("Stage 1: palette built with %d entries", (int)palette.size());
 
-    // Pre-compute Lab for all palette entries (LUT-accelerated)
     const int K = (int)palette.size();
     std::vector<Lab> palLab(K);
     for (int i=0;i<K;++i) palLab[i] = rgbToLabLUT(palette[i]);
@@ -445,12 +417,14 @@ static std::vector<uint32_t> buildPaletteAndAssign(
     UnionFind uf(K);
     if (opt.gradient_step > 0.f) {
         const float thresh2 = opt.gradient_step * opt.gradient_step;
+        int merges = 0;
         for (int ii=0;ii<K;++ii)
             for (int jj=ii+1;jj<K;++jj){
                 const Lab& la=palLab[ii]; const Lab& lb=palLab[jj];
                 float dL=la.L-lb.L, da=la.a-lb.a, db=la.b-lb.b;
-                if (dL*dL+da*da+db*db <= thresh2) uf.unite(ii,jj);
+                if (dL*dL+da*da+db*db <= thresh2) { uf.unite(ii,jj); ++merges; }
             }
+        VT_LOG("Stage 2: gradient merge (step=%.2f) performed %d merges", (double)opt.gradient_step, merges);
     }
 
     struct Acc { double r,g,b; long count; };
@@ -471,8 +445,6 @@ static std::vector<uint32_t> buildPaletteAndAssign(
             (uint8_t)std::clamp((int)(acc.b/acc.count+.5),0,255));
     }
 
-    // Nearest-palette lookup with Lab LUT + cache
-    // Also cache Lab of query colours to avoid redundant computation
     std::unordered_map<uint32_t,uint32_t> nearestCache;
     nearestCache.reserve(freq.size()*2);
     auto nearest = [&](uint32_t c) -> uint32_t {
@@ -513,6 +485,7 @@ static std::vector<uint32_t> buildPaletteAndAssign(
     }
     std::sort(used.begin(),used.end(),
               [](uint32_t a,uint32_t b){return luminance(a)<luminance(b);});
+    VT_LOG("Stage 1+2: %d distinct colours in use after assignment", (int)used.size());
     return used;
 }
 
@@ -583,34 +556,14 @@ static void clearComponent(
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  [E1] Stage 5 — Shared Topology Management
-//
-//  Rather than tracing each colour region independently (which lets RDP
-//  simplify shared edges differently), we:
-//    1. Scan every horizontal and vertical pixel boundary (pixel edge).
-//    2. For each edge where the two adjacent pixels have different canonical
-//       colours, record a directed half-edge keyed by (colorA, colorB).
-//    3. Assemble edge chains by following adjacency in the grid.
-//    4. Expose shared edge chains so the boundary tracer re-uses them
-//       verbatim for both neighbouring colours.
-//
-//  Data structures:
-//   EdgeKey   — ordered pair of colours (lo < hi)
-//   HalfEdge  — one directed segment on a colour boundary
-//   EdgeGraph — maps EdgeKey → sorted vector of HalfEdges
 // ═══════════════════════════════════════════════════════════════════════════
-
-// An axis-aligned unit edge between two adjacent pixels.
-// We store it as the coordinate of the *boundary* in sub-pixel space
-// (multiplied by 2 to stay integer, so boundary at x=2.5 → ix=5).
 struct EdgePixel {
-    int x, y;        // pixel grid coords of the "left/top" pixel
-    int axis;        // 0=horizontal boundary (top/bottom), 1=vertical (left/right)
-    uint32_t cA, cB; // colours on the two sides (cA is always the lesser)
+    int x, y;
+    int axis;
+    uint32_t cA, cB;
 };
 
 struct SharedEdgeGraph {
-    // Maps (colorA<<32|colorB) where colorA<colorB → list of boundary pixels
-    // These are *unordered* raw pixels; the boundary tracer will sort/chain them.
     std::unordered_map<uint64_t, std::vector<EdgePixel>> edges;
 
     static uint64_t key(uint32_t a, uint32_t b) {
@@ -622,10 +575,6 @@ struct SharedEdgeGraph {
         edges[key(cA,cB)].push_back({x, y, axis, cA, cB});
     }
 
-    // Returns true if the boundary between cA and cB at pixel (x,y) was
-    // shared-registered, i.e. these two colours have an explicit shared edge
-    // topology entry. Callers use this to decide whether to snap boundary
-    // vertices to shared-edge positions.
     bool hasEdge(uint32_t cA, uint32_t cB) const {
         return edges.count(key(cA,cB)) > 0;
     }
@@ -637,7 +586,6 @@ static SharedEdgeGraph buildEdgeGraph(
     SharedEdgeGraph graph;
     graph.edges.reserve(256);
 
-    // Horizontal boundaries (pixel (x,y) vs (x,y+1))
     for (int y = 0; y < H-1; ++y) {
         for (int x = 0; x < W; ++x) {
             uint32_t cT = pixelColor[y*W+x];
@@ -646,7 +594,6 @@ static SharedEdgeGraph buildEdgeGraph(
             if (cT != cB) graph.insert(x, y, 0, cT, cB);
         }
     }
-    // Vertical boundaries (pixel (x,y) vs (x+1,y))
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W-1; ++x) {
             uint32_t cL = pixelColor[y*W+x];
@@ -660,15 +607,24 @@ static SharedEdgeGraph buildEdgeGraph(
 
 // ───────────────────────────────────────────────────────────────────────────
 //  Stage 6 — Moore boundary trace (Jacob's stopping criterion)
-//  Pixel centres offset by +0.5 for sub-pixel accuracy.
 //
-//  Enhanced: after tracing, snap any vertex that lies on a registered shared
-//  edge to the canonical sub-pixel boundary position, so adjacent colours
-//  meet *exactly* rather than drifting apart after independent RDP runs.
+//  [FIX-1] Only follow occ==1 (unvisited foreground) pixels as neighbours.
+//           The original used !occ[...] which is false for 0 but TRUE for
+//           both 1 and 2 (already-traced). Following occ==2 pixels lets the
+//           tracer re-enter already-processed boundary rings, defeating the
+//           Jacob stopping criterion and causing the loop to run the full
+//           maxSteps guard on every non-trivial shape.
+//
+//  [FIX-2] maxSteps is now passed in as componentMaxSteps, capped at
+//           min(componentPixels*8 + 16, W*H + 8).  The original used W*H*2+8
+//           unconditionally — that is the right cap for the *entire image*
+//           but wildly over-generous per component, causing multi-second
+//           stalls when many components are present.
 // ───────────────────────────────────────────────────────────────────────────
 static std::vector<Point> traceBoundary(
     int startX, int startY, int W, int H,
-    std::vector<uint8_t>& occ)
+    std::vector<uint8_t>& occ,
+    int componentMaxSteps)   // [FIX-2] caller supplies per-component cap
 {
     std::vector<Point> path; path.reserve(64);
 
@@ -676,9 +632,11 @@ static std::vector<Point> traceBoundary(
     for (int d=0;d<8;++d){
         int nx=startX+DX[d], ny=startY+DY[d];
         if ((unsigned)nx>=(unsigned)W||(unsigned)ny>=(unsigned)H) continue;
-        if (occ[ny*W+nx]){entryDir=d;break;}
+        // [FIX-1] only unvisited foreground pixels qualify as entry context
+        if (occ[ny*W+nx] == 1){entryDir=d;break;}
     }
     if (entryDir==-1){
+        // Isolated pixel (no foreground neighbour in any direction)
         path.push_back({startX+.5f,startY+.5f});
         return path;
     }
@@ -687,9 +645,8 @@ static std::vector<Point> traceBoundary(
     int fromDir=(entryDir+5)%8;
     int firstEntryDir=-1;
     bool firstVisit=true;
-    const int maxSteps=W*H*2+8;
 
-    for (int step=0;step<maxSteps;++step){
+    for (int step=0; step < componentMaxSteps; ++step){
         path.push_back({curX+.5f,curY+.5f});
         occ[curY*W+curX]=2;
         bool found=false;
@@ -697,7 +654,8 @@ static std::vector<Point> traceBoundary(
             int dir=(fromDir+i)%8;
             int nx=curX+DX[dir], ny=curY+DY[dir];
             if ((unsigned)nx>=(unsigned)W||(unsigned)ny>=(unsigned)H) continue;
-            if (!occ[ny*W+nx]) continue;
+            // [FIX-1] only follow unvisited foreground — never re-enter occ==2
+            if (occ[ny*W+nx] != 1) continue;
             if (nx==startX&&ny==startY){
                 if (firstVisit){firstEntryDir=dir;firstVisit=false;}
                 else if (dir==firstEntryDir) return path;
@@ -707,15 +665,21 @@ static std::vector<Point> traceBoundary(
             found=true; break;
         }
         if (!found) break;
+
+        // [FIX-2] Emit a warning if we are about to exhaust the step budget
+        if (step == componentMaxSteps - 2) {
+            VT_WARN("traceBoundary: step budget nearly exhausted "
+                    "(componentMaxSteps=%d, path.size=%d, start=(%d,%d)). "
+                    "Possible degenerate shape — trace will be truncated.",
+                    componentMaxSteps, (int)path.size(), startX, startY);
+        }
     }
     return path;
 }
 
-// Snap boundary vertices to exact shared-edge grid lines.
-// For a pixel at grid integer (px,py), its centre is (px+0.5, py+0.5).
-// The boundary between it and its right neighbour is at x=px+1.0 exactly.
-// This function nudges each traced vertex that is within 'snap' pixels of
-// a shared boundary line to lie exactly on that line.
+// ───────────────────────────────────────────────────────────────────────────
+//  Snap boundary vertices to exact shared-edge grid lines  [E1]
+// ───────────────────────────────────────────────────────────────────────────
 static void snapToSharedEdges(
     std::vector<Point>& path,
     const std::vector<uint32_t>& pixelColor,
@@ -724,25 +688,20 @@ static void snapToSharedEdges(
     float snapDist = 0.6f)
 {
     for (auto& pt : path) {
-        // Integer pixel coords for this vertex
-        int px = (int)pt.x, py = (int)pt.y;
-        px = std::clamp(px, 0, W-1);
-        py = std::clamp(py, 0, H-1);
+        int px = std::clamp((int)pt.x, 0, W-1);
+        int py = std::clamp((int)pt.y, 0, H-1);
 
-        // Check left/right shared boundary
-        float nearestX = std::round(pt.x);  // grid line at integer x
+        float nearestX = std::round(pt.x);
         if (std::abs(pt.x - nearestX) < snapDist) {
             int nx = (int)nearestX;
             if (nx > 0 && nx < W) {
-                // pixels to left and right of this boundary
                 int iL = py*W + (nx-1), iR = py*W + nx;
                 uint32_t cL = (iL>=0&&iL<W*H) ? pixelColor[iL] : 0xFFFFFFFFu;
                 uint32_t cR = (iR>=0&&iR<W*H) ? pixelColor[iR] : 0xFFFFFFFFu;
                 if ((cL==myColor) != (cR==myColor))
-                    pt.x = (float)nx;  // snap to exact boundary
+                    pt.x = (float)nx;
             }
         }
-        // Check top/bottom shared boundary
         float nearestY = std::round(pt.y);
         if (std::abs(pt.y - nearestY) < snapDist) {
             int ny = (int)nearestY;
@@ -751,15 +710,14 @@ static void snapToSharedEdges(
                 uint32_t cT = (iT>=0&&iT<W*H) ? pixelColor[iT] : 0xFFFFFFFFu;
                 uint32_t cB = (iB>=0&&iB<W*H) ? pixelColor[iB] : 0xFFFFFFFFu;
                 if ((cT==myColor) != (cB==myColor))
-                    pt.y = (float)ny;  // snap to exact boundary
+                    pt.y = (float)ny;
             }
         }
     }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-//  Stage 7 — Ramer-Douglas-Peucker simplification
-//  Iterative (stack-based) to avoid stack overflow on large paths.
+//  Stage 7 — Ramer-Douglas-Peucker simplification (iterative, stack-based)
 // ───────────────────────────────────────────────────────────────────────────
 static float ptSegDistSq(const Point& p, const Point& a, const Point& b) {
     float dx=b.x-a.x, dy=b.y-a.y;
@@ -826,23 +784,6 @@ static std::vector<uint8_t> detectCorners(
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  [E3] Stage 9 — Constrained Least-Squares Bézier Fitting
-//         (Schneider-style iterative refinement)
-//
-//  Given a sequence of high-resolution boundary points (the pre-RDP raw
-//  path) and a small set of "key" control positions (the RDP survivors),
-//  we fit one cubic Bézier per inter-key interval by:
-//
-//   a. Parameterise the original points by chord length (u ∈ [0,1]).
-//   b. Set up a 2-DOF least-squares system for the two inner control
-//      points (P1, P2) of the cubic B(t) = (1-t)³P0 + 3(1-t)²t·P1
-//                                        + 3(1-t)t²·P2 + t³·P3
-//      with P0 and P3 fixed (the key vertices).
-//   c. Solve the 2×2 normal equations analytically.
-//   d. Re-parameterise (Newton step) and iterate up to kMaxFitIter times.
-//
-//  If the max residual exceeds kFitTolerance the segment is subdivided at
-//  its worst point and the two halves are fitted independently, giving the
-//  engine a principled fallback for high-curvature regions.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Evaluate cubic Bézier at t
@@ -855,7 +796,7 @@ static Point bezier(const Point& P0, const Point& P1,
             b0*P0.y+b1*P1.y+b2*P2.y+b3*P3.y};
 }
 
-// Chord-length parameterise a range [lo,hi) of rawPts
+// Chord-length parameterise a range of pts[lo..hi)
 static std::vector<float> chordParam(
     const std::vector<Point>& pts, int lo, int hi)
 {
@@ -871,37 +812,36 @@ static std::vector<float> chordParam(
     return u;
 }
 
-// Fit one cubic segment [P0,P3] to raw points in range [lo,hi) of rawPts.
-// Returns {P1, P2} — the two free control points.
 struct CubicFit { Point P1, P2; float maxResidSq; };
 
+// [FIX-4] Accept an external parameterisation `uExt` so the Newton-refined
+//         `u` from the previous iteration is actually used rather than
+//         recomputed from scratch each time.
 static CubicFit fitCubicSegment(
     const std::vector<Point>& raw, int lo, int hi,
-    const Point& P0, const Point& P3)
+    const Point& P0, const Point& P3,
+    const std::vector<float>* uExt = nullptr)   // [FIX-4]
 {
     const int n = hi - lo;
     if (n <= 2) {
-        // Degenerate: linear interpolation
         Point P1 = {P0.x + (P3.x-P0.x)/3.f, P0.y + (P3.y-P0.y)/3.f};
         Point P2 = {P0.x + 2.f*(P3.x-P0.x)/3.f, P0.y + 2.f*(P3.y-P0.y)/3.f};
         return {P1, P2, 0.f};
     }
 
-    std::vector<float> u = chordParam(raw, lo, hi);
-
-    // Normal equations for the 2 inner control points.
-    // B(t) = C0(t)*P0 + C1(t)*P1 + C2(t)*P2 + C3(t)*P3
-    // where C1=3(1-t)²t, C2=3(1-t)t²
-    // Least-squares: minimise Σ|B(u_i) - raw_i|²
-    // Rearrange to: Σ[C1²]·P1 + Σ[C1·C2]·P2 = Σ[C1·(Q_i)]
-    //               Σ[C1·C2]·P1 + Σ[C2²]·P2 = Σ[C2·(Q_i)]
-    // where Q_i = raw_i - C0(u_i)*P0 - C3(u_i)*P3
+    // [FIX-4] Use caller-supplied u if provided, otherwise compute from chord length
+    std::vector<float> u_storage;
+    const std::vector<float>* u = uExt;
+    if (!u || (int)u->size() != n) {
+        u_storage = chordParam(raw, lo, hi);
+        u = &u_storage;
+    }
 
     double A00=0,A01=0,A11=0;
     double Bx0=0,By0=0,Bx1=0,By1=0;
 
     for (int i=0;i<n;++i){
-        float t=u[i];
+        float t=(*u)[i];
         float mt=1.f-t;
         float c0=mt*mt*mt, c1=3.f*mt*mt*t, c2=3.f*mt*t*t, c3=t*t*t;
         float Qx=raw[lo+i].x - c0*P0.x - c3*P3.x;
@@ -911,11 +851,10 @@ static CubicFit fitCubicSegment(
         Bx1+=c2*Qx; By1+=c2*Qy;
     }
 
-    // Solve 2×2 system
     double det = A00*A11 - A01*A01;
     Point P1, P2;
     if (std::abs(det) < 1e-10) {
-        // Singular: fall back to Catmull-Rom tangent estimate
+        // Singular system — fall back to linear interpolation of control points
         P1 = {P0.x + (P3.x-P0.x)/3.f, P0.y + (P3.y-P0.y)/3.f};
         P2 = {P0.x + 2.f*(P3.x-P0.x)/3.f, P0.y + 2.f*(P3.y-P0.y)/3.f};
     } else {
@@ -926,10 +865,9 @@ static CubicFit fitCubicSegment(
         P2.y = (float)((A00*By1 - A01*By0)*invDet);
     }
 
-    // Compute max residual
     float maxRes = 0.f;
     for (int i=0;i<n;++i){
-        Point b = bezier(P0, P1, P2, P3, u[i]);
+        Point b = bezier(P0, P1, P2, P3, (*u)[i]);
         float dx=b.x-raw[lo+i].x, dy=b.y-raw[lo+i].y;
         float r=dx*dx+dy*dy;
         if (r>maxRes) maxRes=r;
@@ -937,8 +875,7 @@ static CubicFit fitCubicSegment(
     return {P1, P2, maxRes};
 }
 
-// Newton reparameterisation step: for each raw point find the closest t
-// on the current Bézier using one Newton iteration.
+// Newton reparameterisation
 static std::vector<float> reparameterise(
     const std::vector<Point>& raw, int lo, int hi,
     const Point& P0, const Point& P1,
@@ -949,10 +886,8 @@ static std::vector<float> reparameterise(
     std::vector<float> u2(n);
     for (int i=0;i<n;++i){
         float t = u[i];
-        // B(t), B'(t)
         Point Bt  = bezier(P0,P1,P2,P3,t);
         float mt=1.f-t;
-        // B'(t) = 3[(1-t)²(P1-P0) + 2(1-t)t(P2-P1) + t²(P3-P2)]
         Point d0 = P1 - P0, d1 = P2 - P1, d2 = P3 - P2;
         Point Bp = {3.f*(mt*mt*d0.x + 2.f*mt*t*d1.x + t*t*d2.x),
                     3.f*(mt*mt*d0.y + 2.f*mt*t*d1.y + t*t*d2.y)};
@@ -965,71 +900,80 @@ static std::vector<float> reparameterise(
 }
 
 // Recursive subdivision Bézier fitter
+// [FIX-4] Pass the refined `u` into fitCubicSegment each iteration instead
+//         of letting it recompute chordParam from scratch and discard the
+//         Newton step.
 static void fitBezierRecursive(
-    const std::vector<Point>& raw, int lo, int hi,  // original high-res points
-    const Point& P0, const Point& P3,               // fixed endpoints
+    const std::vector<Point>& raw, int lo, int hi,
+    const Point& P0, const Point& P3,
     std::vector<Segment>& out,
-    int depth = 0)
+    int depth = 0,
+    float fit_tolerance)
 {
     static constexpr int kMaxDepth = 6;
     if (hi - lo <= 1 || depth > kMaxDepth) {
-        // Leaf: emit a simple line segment
         out.push_back({false,{},{},P3});
         return;
     }
 
-    // Initial parameterisation
+    // [FIX-4] Maintain u across iterations so Newton refinement accumulates
     std::vector<float> u = chordParam(raw, lo, hi);
 
-    // Iterative refinement
     Point P1_best, P2_best;
     float bestRes = 1e30f;
     for (int iter=0; iter<kMaxFitIter; ++iter){
-        CubicFit fit = fitCubicSegment(raw, lo, hi, P0, P3);
+        // [FIX-4] Pass current u into fitter so the refined parameterisation is used
+        CubicFit fit = fitCubicSegment(raw, lo, hi, P0, P3, &u);
         if (fit.maxResidSq < bestRes){
             bestRes = fit.maxResidSq;
             P1_best = fit.P1; P2_best = fit.P2;
         }
-        if (fit.maxResidSq <= kFitTolerance*kFitTolerance) break;
-        // Newton reparameterisation
+        if (fit.maxResidSq <= fit_tolerance*fit_tolerance) break;
+        // Newton reparameterisation — update u for next iteration [FIX-4]
         u = reparameterise(raw, lo, hi, P0, fit.P1, fit.P2, P3, u);
     }
 
-    if (bestRes <= kFitTolerance*kFitTolerance) {
+    if (bestRes <= fit_tolerance*fit_tolerance) {
         out.push_back({true, P1_best, P2_best, P3});
         return;
     }
 
-    // Subdivide at max-residual point and fit each half
-    // Re-run to find the worst-fit index
-    CubicFit fit = fitCubicSegment(raw, lo, hi, P0, P3);
+    // Subdivide at max-residual point
+    // Reuse the last refined u to find the worst point
+    CubicFit fit = fitCubicSegment(raw, lo, hi, P0, P3, &u);
     int worstI = lo;
     {
         float wRes = 0.f;
-        std::vector<float> u2 = chordParam(raw, lo, hi);
         for (int i=0; i<hi-lo; ++i){
-            Point b = bezier(P0, fit.P1, fit.P2, P3, u2[i]);
+            Point b = bezier(P0, fit.P1, fit.P2, P3, u[i]);
             float dx=b.x-raw[lo+i].x, dy=b.y-raw[lo+i].y;
             float r=dx*dx+dy*dy;
             if (r>wRes){wRes=r;worstI=lo+i;}
         }
     }
     if (worstI == lo || worstI == hi-1) {
-        // Can't split usefully — emit what we have
         out.push_back({true, P1_best, P2_best, P3});
         return;
     }
     const Point& Pmid = raw[worstI];
-    fitBezierRecursive(raw, lo,    worstI+1, P0,   Pmid, out, depth+1);
-    fitBezierRecursive(raw, worstI, hi,      Pmid, P3,   out, depth+1);
+    fitBezierRecursive(raw, lo,    worstI+1, P0,   Pmid, out, depth+1,fit_tolerance);
+    fitBezierRecursive(raw, worstI, hi,      Pmid, P3,   out, depth+1,fit_tolerance);
 }
 
-// Build the spline for one boundary region: given simplified key vertices
-// and the original high-res path, produce globally-optimal Bézier segments.
+// Build the spline for one boundary region
+//
+// [FIX-3] key→raw mapping is now precomputed in a single O(nk*nr) pass.
+//         The original called closestRaw() (O(nr)) inside a double loop
+//         (O(nc * nk)), yielding O(nk² * nr) per colour region.
+//
+// [FIX-5] from==to (single corner) is detected up front and treated as a
+//         full-circle run rather than a 1-element degenerate that silently
+//         produces no output.
 static std::vector<Segment> buildSplineLSQ(
-    const std::vector<Point>& keyPts,         // RDP-simplified
+    const std::vector<Point>& keyPts,
     const std::vector<uint8_t>& isCorner,
-    const std::vector<Point>& rawPts)         // original high-res boundary
+    const std::vector<Point>& rawPts,
+    float fFit_Tolerance)
 {
     const int nk = (int)keyPts.size();
     const int nr = (int)rawPts.size();
@@ -1038,18 +982,19 @@ static std::vector<Segment> buildSplineLSQ(
     std::vector<Segment> segs;
     segs.reserve(nk);
 
-    // Map each key vertex to the closest raw vertex index
-    auto closestRaw = [&](const Point& p) -> int {
+    // [FIX-3] Precompute closest raw index for every key vertex in one pass
+    std::vector<int> keyToRaw(nk);
+    for (int ki = 0; ki < nk; ++ki) {
+        const Point& p = keyPts[ki];
         float best = 1e30f; int bi = 0;
-        for (int i=0;i<nr;++i){
+        for (int i = 0; i < nr; ++i){
             float dx=rawPts[i].x-p.x, dy=rawPts[i].y-p.y;
             float d=dx*dx+dy*dy;
             if (d<best){best=d;bi=i;}
         }
-        return bi;
-    };
+        keyToRaw[ki] = bi;
+    }
 
-    // Build corner index list in key-point space
     std::vector<int> corners;
     for (int i=0;i<nk;++i) if (isCorner[i]) corners.push_back(i);
     if (corners.empty()) corners.push_back(0);
@@ -1057,16 +1002,28 @@ static std::vector<Segment> buildSplineLSQ(
     const int nc = (int)corners.size();
     auto nxt = [&](int i){ return (i+1)%nk; };
 
-    for (int ci=0;ci<nc;++ci){
+    for (int ci=0; ci<nc; ++ci){
         int from = corners[ci];
         int to   = corners[(ci+1)%nc];
 
-        // Collect key-point run from→to (circular)
+        // [FIX-5] Handle the single-corner (full-circle) case
+        bool fullCircle = (from == to);
+
         std::vector<int> run;
-        for (int k=from;;k=nxt(k)){
-            run.push_back(k);
-            if (k==to) break;
-            if ((int)run.size()>nk+2) break;
+        if (fullCircle) {
+            // Walk the entire key-point ring
+            for (int k = from;;){
+                run.push_back(k);
+                k = nxt(k);
+                if (k == from) { run.push_back(from); break; }
+                if ((int)run.size() > nk + 2) break;
+            }
+        } else {
+            for (int k=from;;k=nxt(k)){
+                run.push_back(k);
+                if (k==to) break;
+                if ((int)run.size()>nk+2) break;
+            }
         }
         const int rn = (int)run.size();
         if (rn < 2) continue;
@@ -1075,16 +1032,14 @@ static std::vector<Segment> buildSplineLSQ(
             const Point& P0 = keyPts[run[ri]];
             const Point& P3 = keyPts[run[ri+1]];
 
-            // Find raw index range corresponding to this key interval
-            int rlo = closestRaw(P0);
-            int rhi = closestRaw(P3);
+            // [FIX-3] Use precomputed raw indices
+            int rlo = keyToRaw[run[ri]];
+            int rhi = keyToRaw[run[ri+1]];
 
-            // Handle wrap-around in circular raw path
             std::vector<Point> seg_raw;
             if (rlo <= rhi) {
                 seg_raw.assign(rawPts.begin()+rlo, rawPts.begin()+rhi+1);
             } else {
-                // Wrap: rlo..end ++ 0..rhi
                 seg_raw.assign(rawPts.begin()+rlo, rawPts.end());
                 seg_raw.insert(seg_raw.end(), rawPts.begin(), rawPts.begin()+rhi+1);
             }
@@ -1094,14 +1049,13 @@ static std::vector<Segment> buildSplineLSQ(
                 continue;
             }
 
-            // Check if it's a simple short segment — use line
             float dx=P3.x-P0.x, dy=P3.y-P0.y;
             if (dx*dx+dy*dy < 1.f){
                 segs.push_back({false,{},{},P3});
                 continue;
             }
 
-            fitBezierRecursive(seg_raw, 0, (int)seg_raw.size(), P0, P3, segs);
+            fitBezierRecursive(seg_raw, 0, (int)seg_raw.size(), P0, P3, segs,fFit_Tolerance);
         }
     }
     return segs;
@@ -1124,7 +1078,6 @@ static void ensureCCW(std::vector<Point>& p){if(signedArea(p)>0.f)std::reverse(p
 // ───────────────────────────────────────────────────────────────────────────
 //  Stage 11 — SVG output helpers
 // ───────────────────────────────────────────────────────────────────────────
-
 static void appendFloat(std::string& s, float v, int dp){
     char buf[32];
     int len=snprintf(buf,sizeof(buf),"%.*f",dp,(double)v);
@@ -1170,7 +1123,15 @@ static void appendColorHex(std::string& s, uint32_t c){
 // ───────────────────────────────────────────────────────────────────────────
 std::string vectorize(const uint8_t* pixels, int width, int height, Options options)
 {
-    assert(pixels && width>0 && height>0);
+    if (!pixels || width <= 0 || height <= 0) {
+        VT_ERR("vectorize: invalid arguments (pixels=%p, width=%d, height=%d)",
+               (void*)pixels, width, height);
+        assert(false && "vectorize: null pixels or non-positive dimensions");
+        return "";
+    }
+
+    const double t0 = vt_now_ms();
+    VT_LOG("vectorize: start %dx%d (%d pixels)", width, height, width*height);
 
     // Apply defaults for unset options
     if (options.color_precision  <= 0) options.color_precision  = kDefaultColorPrecision;
@@ -1179,40 +1140,67 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
     if (options.path_precision   <  0) options.path_precision   = kDefaultPathPrecision;
     if (options.rdp_epsilon      <= 0) options.rdp_epsilon      = kDefaultRdpEpsilon;
     if (options.blur_radius      <  0) options.blur_radius      = kDefaultBlurRadius;
+    if (options.fit_tolerance    <= 0) options.fit_tolerance    = kFitTolerance;
+
+    VT_LOG("vectorize: options — color_precision=%d gradient_step=%.2f "
+           "color_mode=%s filter_speckle=%d rdp_epsilon=%.2f "
+           "corner_threshold=%.1f fit_tolerance=%.2f "
+           "blur_radius=%.2f path_precision=%d",
+           options.color_precision,
+           (double)options.gradient_step,
+           options.color_mode == ColorMode::BlackAndWhite ? "BlackAndWhite" : "Color",
+           options.filter_speckle,
+           (double)options.rdp_epsilon,
+           (double)options.corner_threshold,
+           (double)options.fit_tolerance,
+           (double)options.blur_radius,
+           options.path_precision);
 
     const int dp = std::clamp(options.path_precision, 0, 6);
     const int N  = width * height;
 
-    // Stage 0: Gaussian pre-blur (SIMD/LUT accelerated)
+    // Stage 0: Gaussian pre-blur
+    double ts = vt_now_ms();
     std::vector<uint8_t> blurred = gaussianBlur(pixels, width, height, options.blur_radius);
+    VT_LOG("Stage 0 (blur sigma=%.2f): %.1f ms", (double)options.blur_radius, vt_now_ms()-ts);
     const uint8_t* src = blurred.data();
 
-    // Stages 1+2: median-cut quantise + Lab gradient merge (LUT accelerated)
+    // Stages 1+2: quantise + Lab gradient merge
+    ts = vt_now_ms();
     std::vector<uint32_t> pixelColor;
     std::vector<uint32_t> palette =
         buildPaletteAndAssign(src, width, height, options, pixelColor);
+    VT_LOG("Stage 1+2 (quantise+merge): %.1f ms, palette=%d colours",
+           vt_now_ms()-ts, (int)palette.size());
 
     if (palette.empty()){
         char buf[128];
         snprintf(buf,sizeof(buf),
                  "<svg xmlns='http://www.w3.org/2000/svg' "
                  "viewBox='0 0 %d %d'></svg>",width,height);
+        VT_WARN("vectorize: palette empty — returning empty SVG");
         return buf;
     }
 
     // Stage 3: connected components
+    ts = vt_now_ms();
     std::vector<uint32_t> componentColor;
     std::vector<int>      componentSize;
     std::vector<int> labelMap =
         labelComponents(pixelColor, width, height, componentColor, componentSize);
+    VT_LOG("Stage 3 (BFS components): %.1f ms, %d components",
+           vt_now_ms()-ts, (int)componentColor.size());
 
     std::unordered_map<uint32_t,std::vector<int>> colorToComponents;
     colorToComponents.reserve(palette.size()*2);
     for (int lbl=0;lbl<(int)componentColor.size();++lbl)
         colorToComponents[componentColor[lbl]].push_back(lbl);
 
-    // [E1] Stage 5: Build shared edge graph ONCE for the entire image
+    // [E1] Stage 5: Build shared edge graph
+    ts = vt_now_ms();
     SharedEdgeGraph edgeGraph = buildEdgeGraph(pixelColor, width, height);
+    VT_LOG("Stage 5 (edge graph): %.1f ms, %d edge groups",
+           vt_now_ms()-ts, (int)edgeGraph.edges.size());
 
     // SVG header
     std::string svg; svg.reserve((size_t)N*6);
@@ -1226,7 +1214,10 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
 
     std::vector<uint8_t> occ(N,0);
 
-    // Stages 4–11: per-colour processing, darkest-first layer order
+    int totalPaths = 0, totalSpeckles = 0, totalTracerMaxStepHits = 0;
+    double timeTrace=0, timeRDP=0, timeBezier=0, timeSVG=0;
+
+    // Stages 4–11: per-colour processing
     for (uint32_t color : palette){
         if (!colorToComponents.count(color)) continue;
 
@@ -1235,8 +1226,8 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             if (pixelColor[i]==color) occ[i]=1;
 
         struct PathRecord {
-            std::vector<Point>   rawPts;      // full high-res boundary [E3]
-            std::vector<Point>   pts;         // RDP-simplified
+            std::vector<Point>   rawPts;
+            std::vector<Point>   pts;
             std::vector<Segment> segs;
             bool                 isHole;
         };
@@ -1251,27 +1242,48 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 // Stage 4: speckle filter
                 if (componentSize[lbl]<options.filter_speckle){
                     clearComponent(idx,lbl,labelMap,occ,width,height);
+                    ++totalSpeckles;
                     continue;
                 }
 
+                // [FIX-2] Per-component step budget: 8 steps per pixel + slack
+                int compMaxSteps = std::min(
+                    componentSize[lbl] * 8 + 16,
+                    N + 8);
+
                 // Stage 6: boundary trace
-                std::vector<Point> raw=traceBoundary(x,y,width,height,occ);
+                double tTrace = vt_now_ms();
+                std::vector<Point> raw=traceBoundary(x,y,width,height,occ,compMaxSteps);
+                timeTrace += vt_now_ms()-tTrace;
+
+                // Detect if tracer hit the step budget (truncated trace)
+                if ((int)raw.size() >= compMaxSteps - 1) {
+                    VT_WARN("Stage 6: tracer hit step budget for component lbl=%d "
+                            "size=%d at (%d,%d) — path may be truncated",
+                            lbl, componentSize[lbl], x, y);
+                    ++totalTracerMaxStepHits;
+                }
+
                 clearComponent(idx,lbl,labelMap,occ,width,height);
                 if ((int)raw.size()<3) continue;
 
-                // [E1] Snap raw boundary vertices to exact shared edge grid lines
+                // [E1] Snap raw boundary vertices to shared edges
                 snapToSharedEdges(raw, pixelColor, color, width, height);
 
-                // Stage 7: RDP simplification (applied to snapped raw)
+                // Stage 7: RDP simplification
+                double tRDP = vt_now_ms();
                 std::vector<Point> simplified=rdpSimplify(raw,options.rdp_epsilon);
+                timeRDP += vt_now_ms()-tRDP;
                 if ((int)simplified.size()<3) continue;
 
                 // Stage 8: corner detection
                 std::vector<uint8_t> corners=
                     detectCorners(simplified,options.corner_threshold);
 
-                // [E3] Stage 9: Constrained LS Bézier fit using raw high-res data
-                std::vector<Segment> segs=buildSplineLSQ(simplified,corners,raw);
+                // [E3] Stage 9: Constrained LS Bézier fit
+                double tBez = vt_now_ms();
+                std::vector<Segment> segs=buildSplineLSQ(simplified,corners,raw,options.fit_tolerance);
+                timeBezier += vt_now_ms()-tBez;
                 if (segs.empty()) continue;
 
                 paths.push_back({std::move(raw),std::move(simplified),
@@ -1317,12 +1329,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         for (auto& pr:paths){
             if (pr.isHole) ensureCCW(pr.pts);
             else           ensureCW(pr.pts);
-            // Re-detect corners after winding fix and rebuild spline [E3]
             auto c2=detectCorners(pr.pts,options.corner_threshold);
-            pr.segs=buildSplineLSQ(pr.pts,c2,pr.rawPts);
+            pr.segs=buildSplineLSQ(pr.pts,c2,pr.rawPts,options.fit_tolerance);
         }
 
-        // Stage 11: emit SVG — group all paths by colour
+        // Stage 11: emit SVG
+        double tSVG = vt_now_ms();
         svg+="<g fill='";
         appendColorHex(svg,color);
         svg+="'>";
@@ -1341,11 +1353,29 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             }
             d+='Z';
             svg+="<path d='"; svg+=d; svg+="'/>";
+            ++totalPaths;
         }
         svg+="</g>";
+        timeSVG += vt_now_ms()-tSVG;
     }
 
     svg+="</svg>";
+
+    const double totalMs = vt_now_ms() - t0;
+    VT_LOG("vectorize: DONE in %.1f ms | paths=%d speckles_dropped=%d "
+           "tracer_budget_hits=%d | "
+           "trace=%.1fms rdp=%.1fms bezier=%.1fms svg=%.1fms | "
+           "svg_bytes=%zu",
+           totalMs, totalPaths, totalSpeckles, totalTracerMaxStepHits,
+           timeTrace, timeRDP, timeBezier, timeSVG,
+           svg.size());
+
+    if (totalTracerMaxStepHits > 0) {
+        VT_WARN("vectorize: %d component(s) hit the tracer step budget. "
+                "Consider reducing image resolution or increasing filter_speckle.",
+                totalTracerMaxStepHits);
+    }
+
     return svg;
 }
 
