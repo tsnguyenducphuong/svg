@@ -1125,8 +1125,8 @@ static std::vector<uint32_t> buildPaletteAndAssign(
 
     // ENH-2 gradient merge
     UnionFind uf(K);
-    if(opt.gradient_step > 0.f){
-        const float thresh2=opt.gradient_step*opt.gradient_step;
+    if(opt.gradient_detect_thresh > 0.f){
+        const float thresh2=opt.gradient_detect_thresh*opt.gradient_detect_thresh;
         int merges=0;
         for(int ii=0;ii<K;++ii)
             for(int jj=ii+1;jj<K;++jj){
@@ -1134,7 +1134,7 @@ static std::vector<uint32_t> buildPaletteAndAssign(
                 float dL=la.L-lb.L,da=la.a-lb.a,db=la.b-lb.b;
                 if(dL*dL+da*da+db*db<=thresh2){uf.unite(ii,jj);++merges;}
             }
-        VT_LOG("Stage 2: gradient merge step=%.2f → %d merges", (double)opt.gradient_step, merges);
+        VT_LOG("Stage 2: gradient merge step=%.2f → %d merges", (double)opt.gradient_detect_thresh, merges);
     }
 
 
