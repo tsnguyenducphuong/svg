@@ -1,6 +1,6 @@
 {
   "name": "expo-image-to-svg",
-  "version": "1.4.2",
+  "version": "1.6.8",
   "description": "Blazing fast expo module to convert image to SVG",
   "main": "build/index.js",
   "types": "build/index.d.ts",

@@ -5,7 +5,8 @@ NS_ASSUME_NONNULL_BEGIN
 @interface ExpoImageToSvgJSIInstaller : NSObject
 
 /**
- * Registers the 'nativeVectorize' function into the global JSI runtime.
+ * Registers the 'nativeVectorize' and 'nativeVectorizeMultiPass' functions
+ * into the global JSI runtime.
  * @param jsiRuntimePtr An opaque pointer to the facebook::jsi::Runtime.
  */
 + (void)install:(void *)jsiRuntimePtr;
