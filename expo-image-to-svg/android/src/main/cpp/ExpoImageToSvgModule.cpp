@@ -3,7 +3,9 @@
 #include <string>
 #include "VTracerEngine.hpp"
 
+
 using namespace facebook;
+
 
 namespace expo::imagetosvg {
 
@@ -11,6 +13,7 @@ namespace expo::imagetosvg {
 // =============================================================================
 //  Helpers
 // =============================================================================
+
 
 // Unwrap a JS Uint8Array value into a raw uint8_t pointer + byte length.
 // Throws a jsi::JSError on any type mismatch.
@@ -86,20 +89,22 @@ static bool getOptBool(
 
 // ---------------------------------------------------------------------------
 //  Map a JS PassOptions object → vtracer::Options.
-//  Used for each of pass1, pass2, pass3 inside vectorizeMultiPassJSI.
+//  Used for pass1, pass2, pass3 (and the reserved pass4/pass5) inside
+//  vectorizeMultiPassJSI.
 //
-//  JS key               C++ field                Notes
-//  ─────────────────    ──────────────────────── ─────────────────────────
-//  precision         →  color_precision           int
-//  segmentThreshold  →  segment_threshold         float
-//  threshold         →  corner_threshold          float (180 - threshold)
-//  filterSpeckle     →  filter_speckle            int
-//  rdpEpsilon        →  rdp_epsilon               float
-//  fitTolerance      →  fit_tolerance             float
-//  pathPrecision     →  path_precision            int
-//  gradientDetectThresh → gradient_detect_thresh  float
-//  bilateralSigmaR   →  bilateral_sigma_r         float
-//  colorMode         →  color_mode                enum
+//  JS key               C++ field                    Notes
+//  ─────────────────    ────────────────────────     ──────────────────────
+//  precision         →  color_precision              int
+//  segmentThreshold  →  segment_threshold            float
+//  threshold         →  corner_threshold             float (180 - threshold)
+//  filterSpeckle     →  filter_speckle               int
+//  rdpEpsilon        →  rdp_epsilon                  float
+//  fitTolerance      →  fit_tolerance                float
+//  pathPrecision     →  path_precision               int
+//  gradientDetectThresh → gradient_detect_thresh     float
+//  bilateralSigmaR   →  bilateral_sigma_r            float
+//  blurRadius        →  blur_radius                  float
+//  colorMode         →  color_mode                   enum
 // ---------------------------------------------------------------------------
 static vtracer::Options parsePassOptions(
     jsi::Runtime& rt,
@@ -112,9 +117,9 @@ static vtracer::Options parsePassOptions(
         passObj.getProperty(rt, "precision").isNumber())
         o.color_precision = (int)passObj.getProperty(rt, "precision").asNumber();
 
-    if (passObj.hasProperty(rt, "segmentThreshold") &&
-        passObj.getProperty(rt, "segmentThreshold").isNumber())
-        o.segment_threshold = (float)passObj.getProperty(rt, "segmentThreshold").asNumber();
+    // if (passObj.hasProperty(rt, "segmentThreshold") &&
+    //     passObj.getProperty(rt, "segmentThreshold").isNumber())
+    //     o.segment_threshold = (float)passObj.getProperty(rt, "segmentThreshold").asNumber();
 
     if (passObj.hasProperty(rt, "threshold") &&
         passObj.getProperty(rt, "threshold").isNumber())
@@ -143,6 +148,10 @@ static vtracer::Options parsePassOptions(
     if (passObj.hasProperty(rt, "bilateralSigmaR") &&
         passObj.getProperty(rt, "bilateralSigmaR").isNumber())
         o.bilateral_sigma_r = (float)passObj.getProperty(rt, "bilateralSigmaR").asNumber();
+
+    if (passObj.hasProperty(rt, "blurRadius") &&
+        passObj.getProperty(rt, "blurRadius").isNumber())
+        o.blur_radius = (float)passObj.getProperty(rt, "blurRadius").asNumber();
 
     if (passObj.hasProperty(rt, "colorMode") &&
         passObj.getProperty(rt, "colorMode").isString()) {
@@ -230,8 +239,8 @@ jsi::Value vectorizeJSI(
     if (params.hasProperty(rt, "gradientDetectThresh") && params.getProperty(rt, "gradientDetectThresh").isNumber())
         opts.gradient_detect_thresh = (float)params.getProperty(rt, "gradientDetectThresh").asNumber();
 
-    if (params.hasProperty(rt, "segmentThreshold") && params.getProperty(rt, "segmentThreshold").isNumber())
-        opts.segment_threshold = (float)params.getProperty(rt, "segmentThreshold").asNumber();
+    // if (params.hasProperty(rt, "segmentThreshold") && params.getProperty(rt, "segmentThreshold").isNumber())
+    //     opts.segment_threshold = (float)params.getProperty(rt, "segmentThreshold").asNumber();
 
     // ── Execute ──────────────────────────────────────────────────────────────
     std::string svg = vtracer::vectorize(pixels, width, height, opts);
@@ -240,30 +249,44 @@ jsi::Value vectorizeJSI(
 
 
 // =============================================================================
-//  JSI host function: nativeVectorizeMultiPass  (NEW)
+//  JSI host function: nativeVectorizeMultiPass  (ENH-12 6-pass pipeline)
 //
 //  JS options object layout (all buffer keys hold Uint8Arrays):
 //
-//   Required:
-//     originalBuffer   Uint8Array  — source RGBA pixels
-//     blurBuffer       Uint8Array  — bilateral/gaussian blurred RGBA
-//     highPassBuffer   Uint8Array  — high-pass detail RGBA
-//     maskBuffer       Uint8Array  — subject mask (R≥128 = fg) RGBA
-//     edgeMapBuffer    Uint8Array  — Canny edge map (strength in R) RGBA
-//     width            number
-//     height           number
+//  Required:
+//    originalBuffer       Uint8Array  — source RGBA pixels
+//    blurBuffer           Uint8Array  — Gaussian/bilateral blurred RGBA
+//    highPassBuffer       Uint8Array  — high-pass residual RGBA
+//                                       each ch = clamp(orig - blur + 128, 0, 255)
+//    maskBuffer           Uint8Array  — subject mask (R ≥ 128 = fg) RGBA
+//    edgeMapBuffer        Uint8Array  — Canny/Sobel edge map (R = strength) RGBA
+//    width                number
+//    height               number
 //
-//   Optional (top-level compositing):
-//     baseDilateRadius     number  → multiPassOpts.baseDilateRadius
-//     highPassGroupOpacity number  → multiPassOpts.highPassGroupOpacity
-//     edgeStrokeWidth      number  → multiPassOpts.edgeStrokeWidth
-//     edgeMinLuminance     number  → multiPassOpts.edgeMinLuminance
-//     enableSubPassAO      bool    → multiPassOpts.enableSubPassAO
+//  Top-level compositing (all optional):
+//    baseDilateRadius       number   → mpOpts.baseDilateRadius     (default 2.0)
+//    edgeStrokeWidth        number   → mpOpts.edgeStrokeWidth       (default 0.5)
+//    edgeMinLuminance       number   → mpOpts.edgeMinLuminance      (default 80)
+//    highPassGroupOpacity   number   → mpOpts.highPassGroupOpacity  (legacy compat)
 //
-//   Optional (per-pass sub-objects):
-//     pass1            PassOptions object → multiPassOpts.pass1
-//     pass2            PassOptions object → multiPassOpts.pass2
-//     pass3            PassOptions object → multiPassOpts.pass3
+//  ENH-12a  Local Color Quantization (Pass 2):
+//    lcqGridW               number   → mpOpts.lcqGridW              (default 16)
+//    lcqGridH               number   → mpOpts.lcqGridH              (default 16)
+//    lcqColorsPerTile       number   → mpOpts.lcqColorsPerTile      (default 24)
+//
+//  ENH-12b  Adaptive Threshold (Pass 3):
+//    microDetailDeltaEThresh number  → mpOpts.microDetailDeltaEThresh (default 6.0)
+//
+//  ENH-12c  Highlight / Shadow extraction (Passes 4 & 5):
+//    highlightLStar         number   → mpOpts.highlightLStar        (default 85.0)
+//    shadowLStar            number   → mpOpts.shadowLStar           (default 28.0)
+//
+//  Per-pass sub-objects (all optional — engine defaults are pre-configured):
+//    pass1   PassOptions  → base/blur layer tuning
+//    pass2   PassOptions  → mid-tones / LCQ layer tuning
+//    pass3   PassOptions  → micro-detail layer tuning
+//    pass4   PassOptions  → highlights layer tuning (reserved, currently ignored)
+//    pass5   PassOptions  → low-lights layer tuning (reserved, currently ignored)
 // =============================================================================
 jsi::Value vectorizeMultiPassJSI(
     jsi::Runtime& rt,
@@ -290,15 +313,15 @@ jsi::Value vectorizeMultiPassJSI(
 
     const size_t expectedBytes = (size_t)(width * height * 4);
 
-    // ── Unwrap all five buffers ───────────────────────────────────────────────
+    // ── Unwrap all five RGBA buffers ──────────────────────────────────────────
     size_t bl0, bl1, bl2, bl3, bl4;
-    uint8_t* originalPixels  = unwrapUint8Array(rt, params, "originalBuffer",  bl0);
-    uint8_t* blurPixels      = unwrapUint8Array(rt, params, "blurBuffer",      bl1);
-    uint8_t* highPassPixels  = unwrapUint8Array(rt, params, "highPassBuffer",  bl2);
-    uint8_t* maskPixels      = unwrapUint8Array(rt, params, "maskBuffer",      bl3);
-    uint8_t* edgeMapPixels   = unwrapUint8Array(rt, params, "edgeMapBuffer",   bl4);
+    uint8_t* originalPixels = unwrapUint8Array(rt, params, "originalBuffer",  bl0);
+    uint8_t* blurPixels     = unwrapUint8Array(rt, params, "blurBuffer",      bl1);
+    uint8_t* highPassPixels = unwrapUint8Array(rt, params, "highPassBuffer",  bl2);
+    uint8_t* maskPixels     = unwrapUint8Array(rt, params, "maskBuffer",      bl3);
+    uint8_t* edgeMapPixels  = unwrapUint8Array(rt, params, "edgeMapBuffer",   bl4);
 
-    // Sanity-check all buffer sizes.
+    // Validate all buffer sizes match the declared dimensions.
     const char* bufKeys[] = {
         "originalBuffer", "blurBuffer", "highPassBuffer",
         "maskBuffer",     "edgeMapBuffer"
@@ -313,27 +336,73 @@ jsi::Value vectorizeMultiPassJSI(
     }
 
     // ── Build MultiPassOptions ────────────────────────────────────────────────
-    vtracer::MultiPassOptions mpOpts; // constructors set per-pass defaults
+    // Start with struct defaults (all matching the C++ header defaults).
+    vtracer::MultiPassOptions mpOpts;
 
-    // Top-level compositing controls
-    mpOpts.baseDilateRadius    = getOptFloat(rt, params, "baseDilateRadius",    mpOpts.baseDilateRadius);
-    mpOpts.highPassGroupOpacity= getOptFloat(rt, params, "highPassGroupOpacity",mpOpts.highPassGroupOpacity);
-    mpOpts.edgeStrokeWidth     = getOptFloat(rt, params, "edgeStrokeWidth",     mpOpts.edgeStrokeWidth);
-    mpOpts.edgeMinLuminance    = getOptInt  (rt, params, "edgeMinLuminance",    mpOpts.edgeMinLuminance);
-    mpOpts.enableSubPassAO     = getOptBool (rt, params, "enableSubPassAO",     mpOpts.enableSubPassAO);
+    // ── Top-level compositing controls ───────────────────────────────────────
 
-    // Per-pass options: if a JS sub-object is supplied, merge its keys over
-    // the already-defaulted C++ Options struct for that pass.
+    // ENH-12d: Variable dilation — base layer seals gaps with 2 px dilation.
+    mpOpts.baseDilateRadius =
+        getOptFloat(rt, params, "baseDilateRadius", mpOpts.baseDilateRadius);
+
+    // Pass 6 (Edge/Ink) stroke parameters.
+    mpOpts.edgeStrokeWidth =
+        getOptFloat(rt, params, "edgeStrokeWidth",  mpOpts.edgeStrokeWidth);
+    mpOpts.edgeMinLuminance =
+        getOptInt  (rt, params, "edgeMinLuminance", mpOpts.edgeMinLuminance);
+
+    // Legacy field kept for source compatibility with existing callers.
+    mpOpts.highPassGroupOpacity =
+        getOptFloat(rt, params, "highPassGroupOpacity", mpOpts.highPassGroupOpacity);
+
+    // ── ENH-12a: Local Color Quantization grid (Pass 2) ───────────────────────
+    // Controls the 16×16 tile partition and per-tile palette depth.
+    mpOpts.lcqGridW =
+        getOptInt(rt, params, "lcqGridW",         mpOpts.lcqGridW);
+    mpOpts.lcqGridH =
+        getOptInt(rt, params, "lcqGridH",         mpOpts.lcqGridH);
+    mpOpts.lcqColorsPerTile =
+        getOptInt(rt, params, "lcqColorsPerTile", mpOpts.lcqColorsPerTile);
+
+    // ── ENH-12b: Adaptive Threshold gate (Pass 3) ─────────────────────────────
+    // Pixels whose high-pass colour is perceptually too close (ΔE < threshold)
+    // to the underlying Pass-2 colour are suppressed, keeping file size earned.
+    mpOpts.microDetailDeltaEThresh =
+        getOptFloat(rt, params, "microDetailDeltaEThresh", mpOpts.microDetailDeltaEThresh);
+
+    // ── ENH-12c: Highlight / Shadow L* thresholds (Passes 4 & 5) ─────────────
+    // Pass 4 extracts pixels above highlightLStar (top ~10% brightness).
+    // Pass 5 extracts pixels below shadowLStar (darkest ~15%).
+    mpOpts.highlightLStar =
+        getOptFloat(rt, params, "highlightLStar", mpOpts.highlightLStar);
+    mpOpts.shadowLStar =
+        getOptFloat(rt, params, "shadowLStar",    mpOpts.shadowLStar);
+
+    // ── Per-pass options ──────────────────────────────────────────────────────
+    // Each pass sub-object is merged over the C++ struct defaults, so only the
+    // fields explicitly provided by the caller are overridden.
+
+    // Pass 1 — Base / blur layer (large smooth painterly fills).
     if (params.hasProperty(rt, "pass1") && params.getProperty(rt, "pass1").isObject())
         mpOpts.pass1 = parsePassOptions(rt, params.getPropertyAsObject(rt, "pass1"), mpOpts.pass1);
 
+    // Pass 2 — Mid-Tones / Local Color Quantization layer.
     if (params.hasProperty(rt, "pass2") && params.getProperty(rt, "pass2").isObject())
         mpOpts.pass2 = parsePassOptions(rt, params.getPropertyAsObject(rt, "pass2"), mpOpts.pass2);
 
+    // Pass 3 — Micro-Detail / Adaptive Threshold high-pass layer.
     if (params.hasProperty(rt, "pass3") && params.getProperty(rt, "pass3").isObject())
         mpOpts.pass3 = parsePassOptions(rt, params.getPropertyAsObject(rt, "pass3"), mpOpts.pass3);
 
-    // ── Execute ──────────────────────────────────────────────────────────────
+    // Pass 4 — Highlights (reserved; engine uses hardcoded optimal values).
+    if (params.hasProperty(rt, "pass4") && params.getProperty(rt, "pass4").isObject())
+        mpOpts.pass4 = parsePassOptions(rt, params.getPropertyAsObject(rt, "pass4"), mpOpts.pass4);
+
+    // Pass 5 — Low-Lights / Shadows (reserved; engine uses hardcoded optimal values).
+    if (params.hasProperty(rt, "pass5") && params.getProperty(rt, "pass5").isObject())
+        mpOpts.pass5 = parsePassOptions(rt, params.getPropertyAsObject(rt, "pass5"), mpOpts.pass5);
+
+    // ── Execute ───────────────────────────────────────────────────────────────
     std::string svg = vtracer::vectorizeMultiPass(
         originalPixels,
         blurPixels,
@@ -373,7 +442,7 @@ Java_expo_modules_imagetosvg_ExpoImageToSvgModule_installJSIBindings(
         expo::imagetosvg::vectorizeJSI);
     runtime.global().setProperty(runtime, "nativeVectorize", std::move(vectorizeFunc));
 
-    // ── nativeVectorizeMultiPass (frequency separation) ──────────────────────
+    // ── nativeVectorizeMultiPass (ENH-12 6-pass Stochastic Painterly) ────────
     auto multiPassFunc = facebook::jsi::Function::createFromHostFunction(
         runtime,
         facebook::jsi::PropNameID::forAscii(runtime, "nativeVectorizeMultiPass"),
