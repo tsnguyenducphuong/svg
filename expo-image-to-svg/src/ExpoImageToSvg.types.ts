@@ -536,12 +536,12 @@ export const MULTI_PASS_DEFAULTS = {
   highPassGroupOpacity:   0.5,   // legacy compat
 
   // ── ENH-12a: Local Color Quantization ──────────────────────────────────
-  lcqGridW:               16,    // 16×16 tile grid
-  lcqGridH:               16,
+  lcqGridW:               24,    // 16×16 tile grid to 24x24 grid
+  lcqGridH:               24,
   lcqColorsPerTile:       24,    // 16–32 per tile recommended
 
   // ── ENH-12b: Adaptive Threshold ────────────────────────────────────────
-  microDetailDeltaEThresh: 6.0,  // ΔE gate for micro-detail pass
+  microDetailDeltaEThresh: 2.0,  // ΔE gate for micro-detail pass: down from 6.0 to 2.0
 
   // ── ENH-12c: Highlight / Shadow thresholds ─────────────────────────────
   highlightLStar:         85.0,  // top ~10% brightness → screen blend
@@ -566,8 +566,8 @@ export const MULTI_PASS_DEFAULTS = {
     precision:            8,     // LCQ handles true quantization
     threshold:            30,    // ENH-12 spec: sharp 30° corners
     filterSpeckle:        1,     // min_area = 1 (keep every region)
-    pathPrecision:        2,     // high path precision
-    rdpEpsilon:           0.8,
+    pathPrecision:        4,     // high path precision
+    rdpEpsilon:           0.25,   //0.8 down to 0.25
     fitTolerance:         0.5,
     gradientDetectThresh: 12.0,
   } satisfies PassOptions,
@@ -575,11 +575,11 @@ export const MULTI_PASS_DEFAULTS = {
   // Pass 3: micro-detail from the high-pass residual.
   // blurRadius: 0 — no re-blurring; bilateralSigmaR: 5 — tight range filter.
   pass3: {
-    precision:            6,     // 64 colours for rich micro-palette
+    precision:            7,     // 64 colours for rich micro-palette to 128 colors
     threshold:            15,    // very sharp — micro-detail is angular
     filterSpeckle:        1,     // min_area = 1 — keep every grain
     pathPrecision:        1,
-    rdpEpsilon:           0.3,   // minimal simplification
+    rdpEpsilon:           0.2,   // minimal simplification
     fitTolerance:         0.5,
     blurRadius:           0,     // NO smoothing (ENH-12 spec)
     bilateralSigmaR:      5.0,   // tight range filter
