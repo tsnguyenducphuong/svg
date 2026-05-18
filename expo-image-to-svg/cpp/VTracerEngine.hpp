@@ -14,49 +14,61 @@
 //      Pass 5  Low-Lights  — multiply-blend shadows (ENH-12c)
 //      Pass 6  Edge/Ink    — Sobel/Canny strokes (multiply)
 //
+//  ENH-16: Variance-Driven Adaptive Tile Quantization
+//    buildLocalColorQuantization() now measures per-tile luminance variance
+//    and maps σ² → independent {color_precision, filter_speckle, min_area}
+//    for each tile.  Two tunable thresholds (kVarFlat, kVarMid) control the
+//    three-tier classification and can be set to 0 to fully disable the
+//    enhancement for backward compatibility.
+//
 // ═══════════════════════════════════════════════════════════════════════════
 #pragma once
+
 
 #include <cstdint>
 #include <string>
 
+
 namespace vtracer {
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Color mode
 // ─────────────────────────────────────────────────────────────────────────────
 enum class ColorMode : uint8_t {
-    Color        = 0,  // full RGB palette
-    BlackAndWhite = 1  // 1-bit luminance threshold
+   Color        = 0,  // full RGB palette
+   BlackAndWhite = 1  // 1-bit luminance threshold
 };
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Single-pass vectorizer options
 //  All floating-point fields default to ≤ 0 → engine applies built-in default.
 // ─────────────────────────────────────────────────────────────────────────────
 struct Options {
-    // Quantization
-    ColorMode color_mode          = ColorMode::Color;
-    int       color_precision     = 0;  // 0 → default (6 → 64 colours)
-                                        // n → 2^n palette entries (1–8)
+   // Quantization
+   ColorMode color_mode          = ColorMode::Color;
+   int       color_precision     = 0;  // 0 → default (6 → 64 colours)
+                                       // n → 2^n palette entries (1–8)
 
-    // Path shape
-    float     corner_threshold    = 0.f; // degrees; 0 → default (120°)
-    int       filter_speckle      = 0;  // min component area in px; 0 → default (4)
-    int       path_precision      = -1; // SVG decimal places; -1 → default (1)
-    float     rdp_epsilon         = 0.f; // RDP simplification; 0 → default (1.5)
-    float     fit_tolerance       = 0.f; // Bézier fit error; 0 → default (0.5)
+   // Path shape
+   float     corner_threshold    = 0.f; // degrees; 0 → default (120°)
+   int       filter_speckle      = 0;  // min component area in px; 0 → default (4)
+   int       path_precision      = -1; // SVG decimal places; -1 → default (1)
+   float     rdp_epsilon         = 0.f; // RDP simplification; 0 → default (1.5)
+   float     fit_tolerance       = 0.f; // Bézier fit error; 0 → default (0.5)
 
-    // Pre-filter
-    float     blur_radius         = 0.f; // bilateral spatial sigma; 0 → no filter
-    float     bilateral_sigma_r   = 0.f; // bilateral range sigma; 0 → default (30)
+   // Pre-filter
+   float     blur_radius         = 0.f; // bilateral spatial sigma; 0 → no filter
+   float     bilateral_sigma_r   = 0.f; // bilateral range sigma; 0 → default (30)
 
-    // Gradient detection (ENH-2)
-    float     gradient_detect_thresh = 0.f; // Lab distance; 0 → default (16)
+   // Gradient detection (ENH-2)
+   float     gradient_detect_thresh = 0.f; // Lab distance; 0 → default (16)
 };
 
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  Multi-pass vectorizer options  (ENH-11 + ENH-12)
+//  Multi-pass vectorizer options  (ENH-11 + ENH-12 + ENH-16)
 //
 //  The caller pre-computes 5 RGBA pixel buffers at the React Native / Expo
 //  Module layer and passes them into vectorizeMultiPass().  The engine then
@@ -81,47 +93,64 @@ struct Options {
 //    in the current release (the engine uses hardcoded optimal values).
 // ─────────────────────────────────────────────────────────────────────────────
 struct MultiPassOptions {
-    // Per-pass options (pass4/pass5/pass6 reserved for future use)
-    Options   pass1;                    // Base layer
-    Options   pass2;                    // Mid-Tones (LCQ)
-    Options   pass3;                    // Micro-Detail (High-Pass + AThresh)
-    Options   pass4;                    // Highlights (internally configured)
-    Options   pass5;                    // Low-Lights (internally configured)
+   // Per-pass options (pass4/pass5/pass6 reserved for future use)
+   Options   pass1;                    // Base layer
+   Options   pass2;                    // Mid-Tones (LCQ)
+   Options   pass3;                    // Micro-Detail (High-Pass + AThresh)
+   Options   pass4;                    // Highlights (internally configured)
+   Options   pass5;                    // Low-Lights (internally configured)
 
-    // ── ENH-12d: Variable dilation ─────────────────────────────────────
-    // Base layer dilation radius.  Set to 2.0 for the full painterly effect
-    // (seals sub-pixel seams); must be ≥ 0.  Detail passes use 0 px dilation.
-    float     baseDilateRadius          = 2.0f;
+   // ── ENH-12d: Variable dilation ─────────────────────────────────────
+   // Base layer dilation radius.  Set to 2.0 for the full painterly effect
+   // (seals sub-pixel seams); must be ≥ 0.  Detail passes use 0 px dilation.
+   float     baseDilateRadius          = 2.0f;
 
-    // ── ENH-12 Local Color Quantization (Pass 2) ───────────────────────
-    // Grid dimensions for the 16×16 tile partition.  Change only if your
-    // image dimensions are very small (e.g. 128×128 → try 8×8).
-    int       lcqGridW                  = 16;
-    int       lcqGridH                  = 16;
-    // Palette entries per tile.  16–32 gives the best quality/size trade-off.
-    int       lcqColorsPerTile          = 24;
+   // ── ENH-12 Local Color Quantization (Pass 2) ───────────────────────
+   // Grid dimensions for the 16×16 tile partition.  Change only if your
+   // image dimensions are very small (e.g. 128×128 → try 8×8).
+   int       lcqGridW                  = 16;
+   int       lcqGridH                  = 16;
+   // Palette entries per tile.  16–32 gives the best quality/size trade-off.
+   int       lcqColorsPerTile          = 24;
 
-    // ── ENH-12b Adaptive Threshold (Pass 3) ───────────────────────────
-    // Minimum CIEDE2000 distance from underlying Pass-2 colour before a
-    // micro-detail pixel is retained.  Lower → more paths (richer texture,
-    // larger file).  Recommended range: 4–10.
-    float     microDetailDeltaEThresh   = 6.0f;
+   // ── ENH-12b Adaptive Threshold (Pass 3) ───────────────────────────
+   // Minimum CIEDE2000 distance from underlying Pass-2 colour before a
+   // micro-detail pixel is retained.  Lower → more paths (richer texture,
+   // larger file).  Recommended range: 4–10.
+   float     microDetailDeltaEThresh   = 6.0f;
 
-    // ── ENH-12c Highlight / Shadow thresholds ─────────────────────────
-    // Pass 4 extracts pixels with CIE L* ≥ highlightLStar (top ~10%).
-    float     highlightLStar            = 85.0f;
-    // Pass 5 extracts pixels with CIE L* ≤ shadowLStar (darkest ~15%).
-    float     shadowLStar               = 28.0f;
+   // ── ENH-12c Highlight / Shadow thresholds ─────────────────────────
+   // Pass 4 extracts pixels with CIE L* ≥ highlightLStar (top ~10%).
+   float     highlightLStar            = 85.0f;
+   // Pass 5 extracts pixels with CIE L* ≤ shadowLStar (darkest ~15%).
+   float     shadowLStar               = 28.0f;
 
-    // ── Pass 6 (Edge/Ink) configuration ───────────────────────────────
-    float     edgeStrokeWidth           = 0.5f;
-    int       edgeMinLuminance          = 80;  // R channel threshold in edge map
+   // ── Pass 6 (Edge/Ink) configuration ───────────────────────────────
+   float     edgeStrokeWidth           = 0.5f;
+   int       edgeMinLuminance          = 80;  // R channel threshold in edge map
 
-    // ── Legacy field (ENH-11 compat) ──────────────────────────────────
-    // highPassGroupOpacity is superseded by the 6-pass opacity constants
-    // but kept for source compatibility with existing callers.
-    float     highPassGroupOpacity      = 0.5f;
+   // ── ENH-16: Variance-Driven Adaptive Tile Quantization ────────────
+   // Two luminance-variance thresholds that drive the three-tier tile
+   // classification in buildLocalColorQuantization():
+   //
+   //   σ² < kVarFlat  → flat / sky tile:
+   //                     color_precision=3, filter_speckle=32, min_area=200
+   //   σ² < kVarMid   → midtone tile:
+   //                     color_precision=6, filter_speckle=4,  min_area=8
+   //   σ² ≥ kVarMid   → high-detail tile (reflections, edges, petals):
+   //                     color_precision=8, filter_speckle=1,  min_area=1
+   //
+   // Set both to 0.0 to disable ENH-16 entirely (backward-compatible).
+   // Recommended defaults: kVarFlat=20.0, kVarMid=150.0
+   float     varFlat                   = 20.0f;
+   float     varMid                    = 150.0f;
+
+   // ── Legacy field (ENH-11 compat) ──────────────────────────────────
+   // highPassGroupOpacity is superseded by the 6-pass opacity constants
+   // but kept for source compatibility with existing callers.
+   float     highPassGroupOpacity      = 0.5f;
 };
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Single-pass entry point (unchanged API)
@@ -129,10 +158,11 @@ struct MultiPassOptions {
 // Accepts a single RGBA pixel buffer (W×H×4 bytes, row-major).
 // Returns a self-contained SVG string.
 std::string vectorize(
-    const uint8_t* pixels,
-    int            width,
-    int            height,
-    Options        options = {});
+   const uint8_t* pixels,
+   int            width,
+   int            height,
+   Options        options = {});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  6-Pass Stochastic Painterly Rendering entry point  (ENH-12)
@@ -157,13 +187,14 @@ std::string vectorize(
 //    layer-highlights, layer-lowlights, layer-edges
 //
 std::string vectorizeMultiPass(
-    const uint8_t*    originalPixels,
-    const uint8_t*    blurPixels,
-    const uint8_t*    highPassPixels,
-    const uint8_t*    maskPixels,
-    const uint8_t*    edgeMapPixels,
-    int               width,
-    int               height,
-    MultiPassOptions  options = {});
+   const uint8_t*    originalPixels,
+   const uint8_t*    blurPixels,
+   const uint8_t*    highPassPixels,
+   const uint8_t*    maskPixels,
+   const uint8_t*    edgeMapPixels,
+   int               width,
+   int               height,
+   MultiPassOptions  options = {});
+
 
 } // namespace vtracer

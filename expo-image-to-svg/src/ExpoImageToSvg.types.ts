@@ -538,7 +538,7 @@ export const MULTI_PASS_DEFAULTS = {
   // ── ENH-12a: Local Color Quantization ──────────────────────────────────
   lcqGridW:               24,    // 16×16 tile grid to 24x24 grid
   lcqGridH:               24,
-  lcqColorsPerTile:       24,    // 16–32 per tile recommended
+  lcqColorsPerTile:       32,    // 16–32 per tile recommended
 
   // ── ENH-12b: Adaptive Threshold ────────────────────────────────────────
   microDetailDeltaEThresh: 2.0,  // ΔE gate for micro-detail pass: down from 6.0 to 2.0
