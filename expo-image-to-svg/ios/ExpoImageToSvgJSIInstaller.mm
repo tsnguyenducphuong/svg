@@ -443,6 +443,11 @@ jsi::Value vectorizeMultiPassJSI(
    mpOpts.lcqColorsPerTile =
        getOptInt(rt, params, "lcqColorsPerTile", mpOpts.lcqColorsPerTile);
 
+   mpOpts.stitchThresh =
+       getOptFloat(rt, params, "stitchThresh", mpOpts.stitchThresh);
+   mpOpts.seamRepairThresh =
+       getOptFloat(rt, params, "seamRepairThresh", mpOpts.seamRepairThresh);
+
 
    // ── ENH-12b: Adaptive Threshold gate (Pass 3) ─────────────────────────────
    // Pixels whose high-pass colour is perceptually too close (ΔE < threshold)

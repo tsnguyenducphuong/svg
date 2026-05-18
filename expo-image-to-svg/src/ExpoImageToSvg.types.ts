@@ -458,6 +458,9 @@ export interface VectorizeMultiPassOptions {
    */
   lcqColorsPerTile?: number;
 
+  stitchThresh?:           number;
+  seamRepairThresh?:       number;
+
   // ── ENH-12b: Adaptive Threshold (Pass 3) ─────────────────────────────────
 
   /**
@@ -539,6 +542,9 @@ export const MULTI_PASS_DEFAULTS = {
   lcqGridW:               24,    // 16×16 tile grid to 24x24 grid
   lcqGridH:               24,
   lcqColorsPerTile:       32,    // 16–32 per tile recommended
+
+  stitchThresh:            3.5,
+  seamRepairThresh:        2.5,
 
   // ── ENH-12b: Adaptive Threshold ────────────────────────────────────────
   microDetailDeltaEThresh: 2.0,  // ΔE gate for micro-detail pass: down from 6.0 to 2.0

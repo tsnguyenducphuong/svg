@@ -516,8 +516,8 @@ private:
 // Local Color Quantization grid dimensions for Pass 2 (Mid-Tones)
 // FIX-COLOR-1: Grid is now adaptive (see buildLocalColorQuantization).
 // These are the maximum values; small images use fewer tiles.
-static constexpr int   kLCQGridW               = 16;   // max 16×16 tile grid
-static constexpr int   kLCQGridH               = 16;
+static constexpr int   kLCQGridW               = 24;   // max 16×16 tile grid
+static constexpr int   kLCQGridH               = 24;
 // FIX-COLOR-2: Raised from 24 → 32 to preserve more local palette richness.
 // 24 was the "midpoint" of 16–32 but caused premature color collapse on complex scenes.
 static constexpr int   kLCQColorsPerTile       = 32;   // 32 per tile (was 24)
@@ -526,7 +526,7 @@ static constexpr int   kLCQColorsPerTile       = 32;   // 32 per tile (was 24)
 
 
 // Adaptive Threshold for Pass 3 (Micro-Detail) — ΔE below this → suppress
-static constexpr float kMicroDetailDeltaEThresh = 6.0f;
+static constexpr float kMicroDetailDeltaEThresh = 2.0f;
 
 
 // ENH-16: Variance thresholds for adaptive tile quantization.
@@ -6163,7 +6163,9 @@ std::string vectorizeMultiPass(
         std::vector<uint32_t> p2Palette =
             buildLCQPaletteAndAssign(
                 maskedOriginal.data(), width, height,
-                kLCQGridW, kLCQGridH, kLCQColorsPerTile,
+                options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW, 
+                options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH, 
+                kLCQColorsPerTile,
                 pass2PixelColor,
                 p2TileOpts,
                 options.varFlat, options.varMid);  // ENH-16 thresholds
@@ -6204,7 +6206,7 @@ std::string vectorizeMultiPass(
         p2.corner_threshold = 30.f;
         p2.filter_speckle   = 1;   // minimal; also gates relaxed micro-suppression
         p2.path_precision   = 2;
-        p2.rdp_epsilon      = 0.8f;
+        p2.rdp_epsilon      = 0.25f;
         p2.blur_radius      = 0.f; // MUST stay 0 -- do NOT smooth LCQ reconstruction
         std::string d, b;
         // ENH-16: use tile-aware pass runner so flat tiles get coarse speckle
@@ -6313,9 +6315,9 @@ std::string vectorizeMultiPass(
         std::vector<uint8_t> adaptedHP =
             adaptiveThresholdHighPass(
                 highPassPixels, pass2PixelColor,
-                width, height, kMicroDetailDeltaEThresh);
+                width, height, options.microDetailDeltaEThresh > 0.f ? options.microDetailDeltaEThresh : kMicroDetailDeltaEThresh);
         Options p3 = options.pass3;
-        p3.color_precision  = 6;
+        p3.color_precision  = 7;
         p3.corner_threshold = 15.f;
         p3.filter_speckle   = 1;
         p3.path_precision   = 1;
