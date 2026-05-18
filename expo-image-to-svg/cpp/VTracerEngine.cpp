@@ -5218,8 +5218,8 @@ static std::vector<uint8_t> applyMaskToPixels(
     const int N = W * H;
     std::vector<uint8_t> out(static_cast<size_t>(N) * 4);
     for (int i = 0; i < N; ++i) {
-        // Mask: R channel encodes foreground (255=fg, 0=bg)
-        bool isFg = (maskPixels[i * 4] >= 128);
+        // Mask: alpha encodes fg/bg
+        bool isFg = (maskPixels[i * 4 + 3] >= 128);
         out[i * 4 + 0] = pixels[i * 4 + 0];
         out[i * 4 + 1] = pixels[i * 4 + 1];
         out[i * 4 + 2] = pixels[i * 4 + 2];
@@ -6117,8 +6117,14 @@ std::string vectorizeMultiPass(
         float baseDilate = (options.baseDilateRadius > 0.f)
                            ? options.baseDilateRadius
                            : kBaseDilateRadiusENH12;
+
+        // FIX: mask blurPixels so Pass 1 only fills foreground regions,
+        // preventing dark background shapes from bleeding through Pass 2/3 holes
+        std::vector<uint8_t> maskedBlur =
+            applyMaskToPixels(blurPixels, maskPixels, width, height);
+
         std::string d, b;
-        runPass(blurPixels, width, height,
+        runPass(maskedBlur.data(), width, height,   // ← was blurPixels
                 p1, baseDilate, false,
                 "layer-base", "p1-",
                 -1.f, nullptr, nullptr,
