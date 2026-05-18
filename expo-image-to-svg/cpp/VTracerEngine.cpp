@@ -581,7 +581,7 @@ static constexpr float kRadialGradVarRatio     = 0.15f;  // variance/mean²
 
 // Pass opacities
 static constexpr float kPass2Opacity           = 0.8f;
-static constexpr float kPass3Opacity           = 0.6f;
+static constexpr float kPass3Opacity           = 0.60f;
 static constexpr float kPass4Opacity           = 0.3f;  // fill-opacity for highlights
 static constexpr float kPass5Opacity           = 0.7f;
 
@@ -6328,7 +6328,8 @@ std::string vectorizeMultiPass(
         runPass(adaptedHP.data(), width, height,
                 p3, 0.f, false,
                 "layer-microdetail", "p3-",
-                kPass3Opacity, nullptr, nullptr,
+                options.highPassGroupOpacity > 0.f ? options.highPassGroupOpacity : kPass3Opacity, 
+                "soft-light", nullptr,
                 d3, b3);
         VT_LOG("vectorizeMultiPass: Pass 3 done in %.1f ms", vt_now_ms() - ts3);
         allDefs += d3; svgBody += b3;
@@ -6377,7 +6378,7 @@ std::string vectorizeMultiPass(
             size_t idPos = edgeSVG.find("id=\"layer-edges\"");
             if (idPos != std::string::npos)
                 edgeSVG.replace(idPos, 16,
-                    "id=\"layer-edges\" style=\"mix-blend-mode:multiply\"");
+                    "id=\"layer-edges\" style=\"mix-blend-mode:overlay\"");
         }
         allDefs += ""; // no defs for edge layer
         svgBody += edgeSVG;

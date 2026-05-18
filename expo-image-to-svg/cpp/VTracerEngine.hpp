@@ -152,7 +152,7 @@ struct MultiPassOptions {
    // ── Legacy field (ENH-11 compat) ──────────────────────────────────
    // highPassGroupOpacity is superseded by the 6-pass opacity constants
    // but kept for source compatibility with existing callers.
-   float     highPassGroupOpacity      = 0.5f;
+   float     highPassGroupOpacity      = 0.6f;
 };
 
 

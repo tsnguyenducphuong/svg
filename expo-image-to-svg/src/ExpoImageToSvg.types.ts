@@ -66,7 +66,7 @@ export type ExpoImageToSvgViewProps = {
 //  baseDilateRadius          baseDilateRadius             12d      2.0
 //  edgeStrokeWidth           edgeStrokeWidth              —        0.5
 //  edgeMinLuminance          edgeMinLuminance             —        80
-//  highPassGroupOpacity      highPassGroupOpacity         legacy   0.5
+//  highPassGroupOpacity      highPassGroupOpacity         legacy   0.6
 //  lcqGridW                  lcqGridW                     12a      16
 //  lcqGridH                  lcqGridH                     12a      16
 //  lcqColorsPerTile          lcqColorsPerTile             12a      24
@@ -426,7 +426,7 @@ export interface VectorizeMultiPassOptions {
    * pass opacity is controlled by the engine's ENH-12 constants. This field
    * is stored but has no effect on Passes 1–6.
    * Maps to C++: `highPassGroupOpacity`.
-   * @default 0.5
+   * @default 0.6
    */
   highPassGroupOpacity?: number;
 
@@ -536,7 +536,7 @@ export const MULTI_PASS_DEFAULTS = {
   baseDilateRadius:       2.0,   // ENH-12d: 2 px seals all base-layer seams
   edgeStrokeWidth:        0.5,   // Pass 6 ink stroke width
   edgeMinLuminance:       80,    // Pass 6 minimum edge R-channel
-  highPassGroupOpacity:   0.5,   // legacy compat
+  highPassGroupOpacity:   0.6,   // legacy compat
 
   // ── ENH-12a: Local Color Quantization ──────────────────────────────────
   lcqGridW:               24,    // 16×16 tile grid to 24x24 grid
