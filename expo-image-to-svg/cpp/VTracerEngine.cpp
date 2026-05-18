@@ -4723,6 +4723,8 @@ static void vectorizeLayerContentTileSpeckle(
            outPaths.size());
 }
 
+// Forward Declaration
+static void scopeSvgIds(std::string& s, const std::string& prefix);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: vectorizeLayerContentWithTileOpts
@@ -4834,8 +4836,7 @@ static void scopeSvgIds(std::string& s, const std::string& prefix)
             pos += urlAttr.size() + prefix.size() + 1;
         }
     }
-}
-
+} 
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: vectorizeLayerContentWithTileOpts — definition
