@@ -117,8 +117,6 @@ struct MultiPassOptions {
 
    float    seamRepairThresh           = 2.5f;
 
-   float microDetailDeltaEThresh       = 6.0f;
-
    // ── ENH-12b Adaptive Threshold (Pass 3) ───────────────────────────
    // Minimum CIEDE2000 distance from underlying Pass-2 colour before a
    // micro-detail pixel is retained.  Lower → more paths (richer texture,
