@@ -146,7 +146,7 @@ export interface PassOptions {
   /**
    * Gradient group detection ΔE threshold. 0 = disabled.
    * Maps to C++: `gradient_detect_thresh`.
-   * @default 16.0
+   * @default 4.0
    */
   gradientDetectThresh?: number;
 
@@ -279,7 +279,7 @@ export interface VectorizeOptions {
    * ΔE threshold for grouping adjacent similar colours into a gradient fill.
    * 0 = disabled.
    * Maps to C++: `gradient_detect_thresh`.
-   * @default 22.0
+   * @default 4.0
    */
   gradientDetectThresh?: number;
 
@@ -569,7 +569,7 @@ export const MULTI_PASS_DEFAULTS = {
     pathPrecision:        4,     // high path precision
     rdpEpsilon:           0.25,   //0.8 down to 0.25
     fitTolerance:         0.5,
-    gradientDetectThresh: 12.0,
+    gradientDetectThresh: 4.0,
   } satisfies PassOptions,
 
   // Pass 3: micro-detail from the high-pass residual.
@@ -583,7 +583,7 @@ export const MULTI_PASS_DEFAULTS = {
     fitTolerance:         0.5,
     blurRadius:           0,     // NO smoothing (ENH-12 spec)
     bilateralSigmaR:      5.0,   // tight range filter
-    gradientDetectThresh: 8.0,
+    gradientDetectThresh: 4.0,
   } satisfies PassOptions,
 
   // pass4 / pass5: engine uses hardcoded optimal values; reserved here for

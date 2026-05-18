@@ -63,7 +63,7 @@ struct Options {
    float     bilateral_sigma_r   = 0.f; // bilateral range sigma; 0 → default (30)
 
    // Gradient detection (ENH-2)
-   float     gradient_detect_thresh = 0.f; // Lab distance; 0 → default (16)
+   float     gradient_detect_thresh = 4.f; // Lab distance; 0 → default (16)
 };
 
 
