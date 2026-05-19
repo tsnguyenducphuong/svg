@@ -6797,9 +6797,30 @@ static std::string buildEdgeLayerSVG(
 
 
 
-    // Build edge mask
+    // Build edge mask with luminance gate (FIX-EDGE-LUM):
+    // Suppress edges where the surrounding original pixels are near-black
+    // (L* < 15). Sobel fires on dark noise in shadow regions producing
+    // strokes that darken already-black areas with no structural value.
+    // We sample a 3x3 neighbourhood mean luminance to avoid single-pixel
+    // bright speckles in shadow from incorrectly passing the gate.
     for (int i = 0; i < N; ++i) {
-        isEdge[i] = (edgeMapPixels[i * 4] >= edgeMinLum);
+        if (edgeMapPixels[i * 4] < edgeMinLum) { isEdge[i] = false; continue; }
+        int y = i / W, x = i % W;
+        float sumLum = 0.f; int cnt = 0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            int ny = y + dy;
+            if (ny < 0 || ny >= H) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = x + dx;
+                if (nx < 0 || nx >= W) continue;
+                const uint8_t* op = originalPixels + (ny * W + nx) * 4;
+                sumLum += 0.2126f * op[0] + 0.7152f * op[1] + 0.0722f * op[2];
+                ++cnt;
+            }
+        }
+        // Mean sRGB luminance < 38 (≈ L* 15 in CIE Lab) → pure shadow, suppress
+        float meanLum = (cnt > 0) ? sumLum / cnt : 0.f;
+        isEdge[i] = (meanLum >= 38.f);
     }
 
 
@@ -7549,20 +7570,13 @@ std::string vectorizeMultiPass(
  
 
 
-    // PERF-ENH-5: Extract highlight and shadow buffers in a single scan.
-    // FIX-PASS45: Apply inverse mask before extraction so Pass 4 (screen) and
-    // Pass 5 (multiply) only affect background pixels (sky, mountains, road).
-    // The car/foreground subject gets its shadow depth directly from Pass 2b's
-    // LCQ palette fills — adding a multiply shadow layer on top of those
-    // silver/painted-metal fills crushes them to near-black incorrectly.
-    std::vector<uint8_t> bgOnlyPixels =
-        applyInverseMaskToPixels(originalPixels, maskPixels, width, height);
+    // PERF-ENH-5: Extract highlight and shadow buffers in a single scan
     std::vector<uint8_t> hlPixels, shadowPixels;
     extractHighlightAndShadowPixels(
-        bgOnlyPixels.data(), width, height,
+        originalPixels, width, height,
         kHighlightLStarThresh, kShadowLStarThresh,
         hlPixels, shadowPixels);
-    VT_LOG("vectorizeMultiPass: highlight+shadow extraction done on bg-only pixels (FIX-PASS45)");
+    VT_LOG("vectorizeMultiPass: highlight+shadow extraction done (single-pass ENH-5)");
 
 
  
