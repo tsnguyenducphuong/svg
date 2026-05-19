@@ -5227,6 +5227,24 @@ static std::vector<uint8_t> applyMaskToPixels(
     }
     return out;
 }
+
+//inverse mask — keeps background pixels, punches foreground transparent.
+static std::vector<uint8_t> applyInverseMaskToPixels(
+    const uint8_t* pixels,
+    const uint8_t* maskPixels,
+    int W, int H)
+{
+    const int N = W * H;
+    std::vector<uint8_t> out(static_cast<size_t>(N) * 4);
+    for (int i = 0; i < N; ++i) {
+        bool isBg = (maskPixels[i * 4 + 3] < 128);
+        out[i * 4 + 0] = pixels[i * 4 + 0];
+        out[i * 4 + 1] = pixels[i * 4 + 1];
+        out[i * 4 + 2] = pixels[i * 4 + 2];
+        out[i * 4 + 3] = isBg ? pixels[i * 4 + 3] : 0;
+    }
+    return out;
+}
  
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6155,9 +6173,66 @@ std::string vectorizeMultiPass(
     // Micro-suppression is relaxed via filter_speckle=1 which routes to
     // shouldSuppressComponentDetail at the vectorize() call site.
     std::vector<uint32_t> pass2PixelColor;
+    // auto fut2 = std::async(std::launch::async, [&]() -> PassResult {
+    //     double ts = vt_now_ms();
+ 
+    //     // Step 1: mask original to foreground only
+    //     std::vector<uint8_t> maskedOriginal =
+    //         applyMaskToPixels(originalPixels, maskPixels, width, height);
+
+    // AFTER — Pass 2a background (new), Pass 2b foreground (renamed from Pass 2)
+
+    // Pass 2a (async) -- background LCQ: sky, mountains, road
+    auto fut2a = std::async(std::launch::async, [&]() -> PassResult {
+        double ts = vt_now_ms();
+        std::vector<uint8_t> maskedBackground =
+            applyInverseMaskToPixels(originalPixels, maskPixels, width, height);
+        std::vector<uint32_t> bgPixelColor;
+        std::vector<TileOptions> bgTileOpts;
+        buildLCQPaletteAndAssign(
+            maskedBackground.data(), width, height,
+            kLCQGridW, kLCQGridH, kLCQColorsPerTile,
+            bgPixelColor, bgTileOpts,
+            options.varFlat, options.varMid);
+        const int N = width * height;
+        std::vector<uint8_t> bgReconstructed(static_cast<size_t>(N) * 4, 0);
+        for (int i = 0; i < N; ++i) {
+            const uint8_t srcAlpha = maskedBackground[static_cast<size_t>(i) * 4 + 3];
+            if (srcAlpha == 0) continue;
+            uint32_t c = bgPixelColor[i];
+            if (c == 0xFFFFFFFFu) continue;
+            uint8_t* dst = bgReconstructed.data() + static_cast<size_t>(i) * 4;
+            dst[0] = static_cast<uint8_t>((c >> 16) & 0xFF);
+            dst[1] = static_cast<uint8_t>((c >>  8) & 0xFF);
+            dst[2] = static_cast<uint8_t>( c        & 0xFF);
+            dst[3] = srcAlpha;
+        }
+        Options p2a = options.pass2;
+        p2a.color_precision  = 8;
+        p2a.corner_threshold = 30.f;
+        p2a.filter_speckle   = 1;
+        p2a.path_precision   = 2;
+        p2a.rdp_epsilon      = 0.8f;
+        p2a.blur_radius      = 0.f;
+        int egW = std::max(1, std::min(kLCQGridW, width  / 64));
+        int egH = std::max(1, std::min(kLCQGridH, height / 64));
+        std::string d, b;
+        runPassWithTileOpts(
+            bgReconstructed.data(), width, height,
+            p2a, kDilateRadius, true,
+            "layer-background", "p2a-",
+            kPass2Opacity, nullptr, nullptr,
+            bgTileOpts, egW, egH,
+            d, b);
+        VT_LOG("vectorizeMultiPass: Pass 2a (background) done in %.1f ms", vt_now_ms() - ts);
+        return {d, b};
+    });
+
+    // Pass 2b (async) -- foreground LCQ: car/subject only (was Pass 2)
+    std::vector<uint32_t> pass2PixelColor;
     auto fut2 = std::async(std::launch::async, [&]() -> PassResult {
         double ts = vt_now_ms();
- 
+
         // Step 1: mask original to foreground only
         std::vector<uint8_t> maskedOriginal =
             applyMaskToPixels(originalPixels, maskPixels, width, height);
@@ -6296,15 +6371,15 @@ std::string vectorizeMultiPass(
     // their threads complete before locals are destroyed.
     // We use a lambda-based scope guard that stores futures by pointer.
     struct FutureJoiner {
-        std::future<PassResult>* futures[3];
+        std::future<PassResult>* futures[4];
         bool done = false;
         ~FutureJoiner() {
             if (done) return;
             for (auto* fp : futures)
                 if (fp && fp->valid()) try { fp->get(); } catch (...) {}
         }
-    } joiner{{&fut1, &fut4, &fut5}};
-
+    // } joiner{{&fut1, &fut4, &fut5}};
+    } joiner{{&fut1, &fut2a, &fut4, &fut5}};
 
 
 
@@ -6346,14 +6421,31 @@ std::string vectorizeMultiPass(
     // FIX-MEM-2c: Mark joiner done BEFORE calling get() so the destructor
     // does not double-call get() on already-consumed futures (UB).
     joiner.done = true;
+    // {
+    //     // Pass 1 is the bottom layer -- prepend before Pass 2+3
+    //     auto [d1, b1] = fut1.get();
+    //     allDefs = d1 + allDefs;
+    //     svgBody = b1 + svgBody;
+    // }
+    // { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
+    // { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
+
+    //layer order bottom→top: Pass1, Pass2a(bg), Pass2b(fg)+Pass3, Pass4, Pass5
     {
-        // Pass 1 is the bottom layer -- prepend before Pass 2+3
+        // Pass 2a background sits above Pass 1 but below the foreground
+        auto [d2a, b2a] = fut2a.get();
+        allDefs = d2a + allDefs;
+        svgBody = b2a + svgBody;
+    }
+    {
+        // Pass 1 is the bottom-most layer
         auto [d1, b1] = fut1.get();
         allDefs = d1 + allDefs;
         svgBody = b1 + svgBody;
     }
     { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
     { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
+
     VT_LOG("vectorizeMultiPass: Passes 1-5 complete (parallel ENH-10)");
  
 
