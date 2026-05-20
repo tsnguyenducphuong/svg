@@ -10856,21 +10856,44 @@ std::string vectorizeMultiPass(
             dst[2] = static_cast<uint8_t>( c        & 0xFF);
             dst[3] = srcAlpha;
         }
+        // TRUE-COLOR FIX for background: trace maskedBackground (real pixels)
+        // instead of bgReconstructed (flat LCQ centroids).
+        //
+        // bgReconstructed collapses every flower petal tile to 1-32 centroid
+        // colors — a tile of mixed red/yellow/green flowers averages to dark
+        // muddy brown. The tracer then faithfully reproduces that mud.
+        //
+        // LCQ is still run to build bgTileOpts (tile-aware speckle thresholds)
+        // and bgPixelColor (used by Stage 4b hole-fill). But the tracer input
+        // must be real pixel values so K-means inside vectorize() operates on
+        // true flower/grass/sky colors, not pre-averaged centroids.
+        //
+        // blur_radius=1.2 + bilateral_sigma_r=20: stronger smooth than Pass 2b
+        // because background has more JPEG noise in foliage and grass, but
+        // sigma_r=20 keeps flower petal boundaries (ΔE > 20) sharp.
+        // filter_speckle=4: slightly more aggressive than subject (=1) to
+        // prevent the thousands of tiny leaf/petal speckles from generating
+        // excessive path counts while preserving meaningful flower shapes.
+        // rdp_epsilon=0.5: slightly looser than Pass 2b to simplify the
+        // complex organic outlines of foliage into clean SVG curves.
         Options p2a = options.pass2;
-        p2a.color_precision  = 8;
-        p2a.corner_threshold = 30.f;
-        p2a.filter_speckle   = 1;
-        p2a.path_precision   = 2;
-        p2a.rdp_epsilon      = 0.8f;
-        p2a.blur_radius      = 0.f;
-        int egW = std::max(1, std::min(kLCQGridW, width  / 64));
-        int egH = std::max(1, std::min(kLCQGridH, height / 64));
+        p2a.color_precision   = 8;    // full palette for flower/sky color richness
+        p2a.corner_threshold  = 45.f; // more corners allowed for organic shapes
+        p2a.filter_speckle    = 4;    // suppress micro-noise, keep flower petals
+        p2a.path_precision    = 2;
+        p2a.rdp_epsilon       = 0.5f; // slightly loose for organic background curves
+        p2a.blur_radius       = 1.2f; // stronger denoise on noisy foliage
+        p2a.bilateral_sigma_r = 20.f; // keep flower/sky color boundaries sharp
+        int lcqW2a = options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW;
+        int lcqH2a = options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH;
+        int egW = std::max(1, std::min(lcqW2a, width  / 64));
+        int egH = std::max(1, std::min(lcqH2a, height / 64));
         std::string d, b;
         runPassWithTileOpts(
-            bgReconstructed.data(), width, height,
+            maskedBackground.data(), width, height,  // TRUE-COLOR: real pixels not LCQ
             p2a, kDilateRadius, true,
             "layer-background", "p2a-",
-            kPass2Opacity, nullptr, nullptr,
+            -1.f, nullptr, nullptr,   // full opacity — bg must not bleed over fg
             bgTileOpts, egW, egH,
             d, b);
         VT_LOG("vectorizeMultiPass: Pass 2a (background) done in %.1f ms", vt_now_ms() - ts);
@@ -10942,36 +10965,37 @@ std::string vectorizeMultiPass(
 
 
 
-        // Step 4: Configure tracer for TRUE-COLOR fidelity on the subject.
-        // Tracer input is maskedOriginal (real pixel values), not lcqReconstructed.
-        // LCQ (Steps 2-3) is retained only for p2TileOpts and pass2PixelColor.
-        // color_precision=8  -> full 256-slot K-means on real silver/paint gradients.
-        // filter_speckle=1   -> preserve micro-regions (panel gaps, reflections).
-        // blur_radius=0.8    -> light bilateral smooth reduces noise without killing
-        //                       metallic gradients or paint color boundaries.
+        // Step 4: Configure tracer for maximum LCQ color fidelity.
+        // color_precision=8  -> up to 256 palette slots; prevents re-collapse of
+        //                        per-tile colors back to a small global palette.
+        // filter_speckle=1   -> near-zero speckle removal, preserves micro-regions;
+        //                       also gates shouldSuppressComponentDetail (relaxed)
+        //                       at the micro-suppression branch in vectorize().
+        // blur_radius=0      -> no pre-blur; must not smooth the LCQ reconstruction.
         Options p2 = options.pass2;
-        p2.color_precision  = 8;
+        p2.color_precision  = 8;   // allow full LCQ palette through quantization stage
         p2.corner_threshold = 30.f;
-        p2.filter_speckle   = 1;
+        p2.filter_speckle   = 1;   // minimal; also gates relaxed micro-suppression
         p2.path_precision   = 2;
         p2.rdp_epsilon      = 0.25f;
-        p2.blur_radius       = 0.8f;   // light smooth on real original pixels
-        p2.bilateral_sigma_r = 25.f;   // preserve color edges (paint/shadow boundary)
+        p2.blur_radius      = 0.f; // MUST stay 0 -- do NOT smooth LCQ reconstruction
         std::string d, b;
-        // TRUE-COLOR FIX: trace maskedOriginal (real pixel colors) not lcqReconstructed.
-        // lcqReconstructed posterizes every intra-region pixel to a flat centroid,
-        // destroying the metallic gradient, paint variation, and specular detail that
-        // makes silver look silver. The LCQ step still builds p2TileOpts (tile-aware
-        // speckle thresholds) and pass2PixelColor (used by Pass 3 high-pass), but the
-        // tracer must see real colors to produce true-color SVG paths.
+        // ENH-16: use tile-aware pass runner so flat tiles get coarse speckle
+        // thresholds and detail tiles preserve micro-paths.
         {
-            int lcqW2b = options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW;
-            int lcqH2b = options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH;
-            int egW = std::max(1, std::min(lcqW2b, width  / 64));
-            int egH = std::max(1, std::min(lcqH2b, height / 64));
+            // Compute effective grid dimensions matching buildLocalColorQuantization.
+            int egW = std::max(1, std::min(kLCQGridW, width  / 64));
+            int egH = std::max(1, std::min(kLCQGridH, height / 64));
+
+
+
+
+
+
+
 
             runPassWithTileOpts(
-                maskedOriginal.data(), width, height,  // TRUE-COLOR: real pixels not LCQ
+                lcqReconstructed.data(), width, height,
                 p2, kDilateRadius, true,
                 "layer-midtones", "p2-",
                 kPass2Opacity, nullptr, nullptr,
