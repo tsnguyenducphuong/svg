@@ -1917,15 +1917,25 @@ static std::vector<uint32_t> kMeansPlusPlusRefine(
     // CIEDE2000 is reserved only for the convergence gate where perceptual
     // scale genuinely matters.
     for (int iter = 0; iter < kKMeansIter; ++iter) {
+        // TRUE-COLOR: Final iteration uses CIEDE2000 for perceptually accurate
+        // assignment. Lab Euclidean underweights the b* (blue-yellow) axis,
+        // collapsing sky-blue and grey-mountain into one centroid. CIEDE2000
+        // on the last pass corrects this at 1/kKMeansIter the cost overhead.
+        const bool finalIter = (iter == kKMeansIter - 1);
         for (int i = 0; i < ne; ++i) {
             float best = 1e30f; int bi = 0;
             const Lab& el = entryLab[i];
             for (int k = 0; k < K; ++k) {
-                // PERF-ENH-1: labDistSq instead of ciede2000 (≈50× faster)
-                float dL = el.L - centroids[k].lab.L;
-                float da = el.a - centroids[k].lab.a;
-                float db = el.b - centroids[k].lab.b;
-                float d  = dL*dL + da*da + db*db;
+                float d;
+                if (finalIter) {
+                    d = ciede2000(el, centroids[k].lab);  // perceptually uniform
+                } else {
+                    // PERF-ENH-1: labDistSq for early iterations (≈50× faster)
+                    float dL = el.L - centroids[k].lab.L;
+                    float da = el.a - centroids[k].lab.a;
+                    float db = el.b - centroids[k].lab.b;
+                    d = dL*dL + da*da + db*db;
+                }
                 if (d < best) { best = d; bi = k; }
             }
             assign[i] = bi;
@@ -2455,15 +2465,25 @@ static std::vector<TilePalette> buildLocalColorQuantization(
 
 
             for (int iter = 0; iter < kKMeansIter; ++iter) {
-                // Assignment step: Lab Euclidean squared (PERF-ENH-1: 50× faster than CIEDE2000)
+                // TRUE-COLOR: Final iteration uses CIEDE2000 for perceptually
+                // accurate tile-palette assignment. Early iters use Lab Euclidean
+                // for speed; final iter corrects b*-axis underweighting so
+                // flower reds, sky blues, and grass greens land in distinct
+                // centroids rather than collapsing to muddy averages.
+                const bool finalIter = (iter == kKMeansIter - 1);
                 for (int i = 0; i < ne; ++i) {
                     float best = 1e30f; int bi = 0;
                     const Lab& el = entryLab[i];
                     for (int k = 0; k < K; ++k) {
-                        float dL = el.L - centroids[k].lab.L;
-                        float da = el.a - centroids[k].lab.a;
-                        float db = el.b - centroids[k].lab.b;
-                        float d  = dL*dL + da*da + db*db;
+                        float d;
+                        if (finalIter) {
+                            d = ciede2000(el, centroids[k].lab);
+                        } else {
+                            float dL = el.L - centroids[k].lab.L;
+                            float da = el.a - centroids[k].lab.a;
+                            float db = el.b - centroids[k].lab.b;
+                            d = dL*dL + da*da + db*db;
+                        }
                         if (d < best) { best = d; bi = k; }
                     }
                     assign[i] = bi;
@@ -2986,11 +3006,15 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
                 Lab rawLab = rgbToLabLUT(raw);
                 float best = 1e30f; uint32_t bestC = tp.colors[0];
                 for (size_t i = 0; i < tp.colors.size(); ++i) {
-                    // PERF-ENH-1: Lab Euclidean squared for nearest-palette lookup
-                    float dL = rawLab.L - tpLab[i].L;
-                    float da = rawLab.a - tpLab[i].a;
-                    float db = rawLab.b - tpLab[i].b;
-                    float d  = dL*dL + da*da + db*db;
+                    // TRUE-COLOR: CIEDE2000 for final pixel→palette snap.
+                    // This is the assignment that writes pass2PixelColor and
+                    // determines which palette centroid each pixel belongs to.
+                    // Using Lab Euclidean here collapses perceptually distinct
+                    // colors (flower red vs shadow brown, sky blue vs grey rock)
+                    // into wrong centroids due to b*-axis underweighting.
+                    // Cost: O(N×K) CIEDE2000 calls per tile — acceptable since
+                    // tile N is small (~64×64 = 4096 px) and K ≤ 32.
+                    float d = ciede2000(rawLab, tpLab[i]);
                     if (d < best) { best = d; bestC = tp.colors[i]; }
                 }
                 pixelColor[y * W + x] = bestC;
@@ -10856,44 +10880,21 @@ std::string vectorizeMultiPass(
             dst[2] = static_cast<uint8_t>( c        & 0xFF);
             dst[3] = srcAlpha;
         }
-        // TRUE-COLOR FIX for background: trace maskedBackground (real pixels)
-        // instead of bgReconstructed (flat LCQ centroids).
-        //
-        // bgReconstructed collapses every flower petal tile to 1-32 centroid
-        // colors — a tile of mixed red/yellow/green flowers averages to dark
-        // muddy brown. The tracer then faithfully reproduces that mud.
-        //
-        // LCQ is still run to build bgTileOpts (tile-aware speckle thresholds)
-        // and bgPixelColor (used by Stage 4b hole-fill). But the tracer input
-        // must be real pixel values so K-means inside vectorize() operates on
-        // true flower/grass/sky colors, not pre-averaged centroids.
-        //
-        // blur_radius=1.2 + bilateral_sigma_r=20: stronger smooth than Pass 2b
-        // because background has more JPEG noise in foliage and grass, but
-        // sigma_r=20 keeps flower petal boundaries (ΔE > 20) sharp.
-        // filter_speckle=4: slightly more aggressive than subject (=1) to
-        // prevent the thousands of tiny leaf/petal speckles from generating
-        // excessive path counts while preserving meaningful flower shapes.
-        // rdp_epsilon=0.5: slightly looser than Pass 2b to simplify the
-        // complex organic outlines of foliage into clean SVG curves.
         Options p2a = options.pass2;
-        p2a.color_precision   = 8;    // full palette for flower/sky color richness
-        p2a.corner_threshold  = 45.f; // more corners allowed for organic shapes
-        p2a.filter_speckle    = 4;    // suppress micro-noise, keep flower petals
-        p2a.path_precision    = 2;
-        p2a.rdp_epsilon       = 0.5f; // slightly loose for organic background curves
-        p2a.blur_radius       = 1.2f; // stronger denoise on noisy foliage
-        p2a.bilateral_sigma_r = 20.f; // keep flower/sky color boundaries sharp
-        int lcqW2a = options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW;
-        int lcqH2a = options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH;
-        int egW = std::max(1, std::min(lcqW2a, width  / 64));
-        int egH = std::max(1, std::min(lcqH2a, height / 64));
+        p2a.color_precision  = 8;
+        p2a.corner_threshold = 30.f;
+        p2a.filter_speckle   = 1;
+        p2a.path_precision   = 2;
+        p2a.rdp_epsilon      = 0.8f;
+        p2a.blur_radius      = 0.f;
+        int egW = std::max(1, std::min(kLCQGridW, width  / 64));
+        int egH = std::max(1, std::min(kLCQGridH, height / 64));
         std::string d, b;
         runPassWithTileOpts(
-            maskedBackground.data(), width, height,  // TRUE-COLOR: real pixels not LCQ
+            bgReconstructed.data(), width, height,
             p2a, kDilateRadius, true,
             "layer-background", "p2a-",
-            -1.f, nullptr, nullptr,   // full opacity — bg must not bleed over fg
+            kPass2Opacity, nullptr, nullptr,
             bgTileOpts, egW, egH,
             d, b);
         VT_LOG("vectorizeMultiPass: Pass 2a (background) done in %.1f ms", vt_now_ms() - ts);
