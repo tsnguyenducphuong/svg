@@ -282,6 +282,7 @@
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  BUG FIXES (2025) -- Memory management + Color quality
 // ═════════════════════════════════════════════════════════════════════════════
@@ -335,8 +336,10 @@
 //                with insufficient pixel samples for reliable K-means.
 // ═════════════════════════════════════════════════════════════════════════════
 
+
 #include "VTracerEngine.hpp"
 // ENH-11: Multi-Pass Frequency Separation (see vectorizeMultiPass below)
+
 
 #include <algorithm>
 #include <array>
@@ -357,6 +360,7 @@
 #include <unordered_set>
 #include <vector>
 
+
 // ── Logging ──────────────────────────────────────────────────────────────────
 #ifdef __ANDROID__
 #  include <android/log.h>
@@ -369,6 +373,7 @@
 #  define VT_ERR(fmt,...)  fprintf(stderr,"[VTracer ERR]  " fmt "\n",##__VA_ARGS__)
 #endif
 
+
 // ── Timing ───────────────────────────────────────────────────────────────────
 static inline double vt_now_ms() noexcept {
     using Clock = std::chrono::steady_clock;
@@ -376,7 +381,9 @@ static inline double vt_now_ms() noexcept {
     return std::chrono::duration_cast<Ms>(Clock::now().time_since_epoch()).count();
 }
 
+
 namespace vtracer {
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Constants (original)
@@ -400,16 +407,19 @@ static constexpr float kDilateRadius           = 0.5f;
 static constexpr int   kKMeansIter             = 8;
 static constexpr int   kSpatialSmoothR         = 2;
 
+
 // ENH-6 thresholds
 static constexpr int   kMicroClusterAbsMax     = 500;
 static constexpr float kMicroClusterAreaFrac   = 0.005f;
 static constexpr float kMicroClusterDeThresh   = 12.f;
+
 
 // ENH-7 thresholds
 static constexpr int   kClusterGradMinPixels   = 100;
 static constexpr int   kClusterGradMaxSample   = 3000;
 static constexpr float kClusterGradDeThresh    = 15.f;
 static constexpr float kClusterGradTailFrac    = 0.15f;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-8 Constants — Region-Aware Quantization
@@ -425,12 +435,14 @@ static constexpr float kSpecularBudgetFrac     = 0.10f;
 // Minimum palette entries per zone
 static constexpr int   kZoneMinColors          = 2;
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-9 Constants — Gradient Classification & Lighting Inference
 // ─────────────────────────────────────────────────────────────────────────────
 static constexpr float kSpecularKurtosisThresh = 2.5f;  // excess kurtosis → specular
 static constexpr float kRimEdgeBiasThresh      = 0.55f; // bright-pixel edge fraction → rim
 static constexpr float kAOSkewThresh           = -0.5f; // negative skew → AO shadow
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-10 Constants — Artistic Gradient Overlays
@@ -439,6 +451,7 @@ static constexpr float kSpecularOverlayOpacity = 0.55f;
 static constexpr float kRimOverlayOpacity      = 0.40f;
 static constexpr float kAOVignetteOpacity      = 0.22f;
 static constexpr float kRimContractFrac        = 0.92f; // inset factor for rim path
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  PERF-NEW-1: Portable counting semaphore — NDK / C++14/17/20 compatible.
@@ -464,6 +477,7 @@ private:
     int                     count_;
 };
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-12 Constants — Stochastic Painterly 6-Pass Pipeline
 // ─────────────────────────────────────────────────────────────────────────────
@@ -476,8 +490,10 @@ static constexpr int   kLCQGridH               = 24;
 // 24 was the "midpoint" of 16–32 but caused premature color collapse on complex scenes.
 static constexpr int   kLCQColorsPerTile       = 32;   // 32 per tile (was 24)
 
+
 // Adaptive Threshold for Pass 3 (Micro-Detail) — ΔE below this → suppress
 static constexpr float kMicroDetailDeltaEThresh = 2.0f;
+
 
 // ENH-16: Variance thresholds for adaptive tile quantization.
 // Tiles below kVarFlat → flat fill; below kVarMid → mid-scale; else → detail.
@@ -485,6 +501,7 @@ static constexpr float kMicroDetailDeltaEThresh = 2.0f;
 // below are the compile-time fallbacks used by the internal helper.
 static constexpr float kVarFlat = 20.0f;
 static constexpr float kVarMid  = 150.0f;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-13 Constants — Hue-Aware Cross-Tile Palette Stitching
@@ -504,35 +521,48 @@ static constexpr float kStitchThresh      = 3.5f;  // ΔE for Pass A centroid me
 static constexpr float kSeamRepairThresh  = 2.5f;  // ΔE for Pass B pixel reclassify
 static constexpr int   kStitchMinCount    = 8;     // min pixels for weighted average
 
+
 // Micro-suppression relaxation for detail passes (lower = more micro-components)
 static constexpr int   kDetailMicroClusterAbsMax  = 8000; // was 500
 static constexpr float kDetailMicroClusterAreaFrac = 0.0005f; // was 0.005
+
 
 // Highlight / shadow extraction thresholds (CIE L*)
 static constexpr float kHighlightLStarThresh   = 85.0f;  // top ~10% luminance
 static constexpr float kShadowLStarThresh      = 28.0f;  // bottom ~15% luminance
 
+
 // Radial gradient fitting: minimum pixels and minimum variance ratio
 static constexpr int   kRadialGradMinPixels    = 300;
 static constexpr float kRadialGradVarRatio     = 0.15f;  // variance/mean²
+
 
 // Pass opacities
 // FIX-D: Raised 0.80 → 0.92. At 0.80 the 8-colour Pass-1 undercoat bleeds
 // through at 20%, washing out the richer LCQ hues in Pass 2. At 0.92 the
 // base acts only as a gap-filler and is invisible on continuous surfaces.
 static constexpr float kPass2Opacity           = 0.92f;
-static constexpr float kPass3Opacity           = 0.60f;
-static constexpr float kPass4Opacity           = 0.3f;  // fill-opacity for highlights
-static constexpr float kPass5Opacity           = 0.7f;
+// FIX-DARK-1: Pass 3 soft-light at 0.60 was desaturating/darkening the mid-tones
+// on an already dark base. Raised to 0.75 and blend changed to "normal" for fidelity.
+static constexpr float kPass3Opacity           = 0.75f;
+// FIX-DARK-2: Pass 4 had BOTH groupOpacity=0.3 AND fillOpacityAttr="0.3" → effective
+// alpha = 0.09 (invisible). Use a single group opacity of 0.55 for screen highlights.
+static constexpr float kPass4Opacity           = 0.55f; // group-level opacity only
+// FIX-DARK-3: Pass 5 multiply shadows were stacking with multiply edge layer (Pass 6)
+// causing compounded darkening. Lowered to 0.45 so shadow contribution is subtle.
+static constexpr float kPass5Opacity           = 0.45f;
+
 
 // Base layer dilation (much larger than kDilateRadius to seal background gaps)
 static constexpr float kBaseDilateRadiusENH12  = 2.0f;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Geometry
 // ─────────────────────────────────────────────────────────────────────────────
 struct Point   { float x, y; };
 struct Segment { bool isCurve; Point cp1, cp2, end; };
+
 
 static inline Point  operator+(const Point& a,const Point& b) noexcept {return {a.x+b.x,a.y+b.y};}
 static inline Point  operator-(const Point& a,const Point& b) noexcept {return {a.x-b.x,a.y-b.y};}
@@ -546,9 +576,11 @@ static inline Point  normalize(const Point& p) noexcept {
     return l > 1e-8f ? Point{p.x/l, p.y/l} : Point{0.f,0.f};
 }
 
+
 // Moore neighbourhood
 static constexpr int DX[8] = { 0,  1,  1,  1,  0, -1, -1, -1 };
 static constexpr int DY[8] = {-1, -1,  0,  1,  1,  1,  0, -1 };
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Union-Find
@@ -566,6 +598,7 @@ struct UnionFind {
     }
 };
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Colour helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -577,6 +610,7 @@ static inline uint8_t  rCh(uint32_t c)   noexcept {return(c>>16)&0xFF;}
 static inline uint8_t  gCh(uint32_t c)   noexcept {return(c>> 8)&0xFF;}
 static inline uint8_t  bCh(uint32_t c)   noexcept {return c     &0xFF;}
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  CIE-Lab LUT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -585,6 +619,7 @@ struct LabLUT {
     float labF[1024];
     static constexpr float kFDomain = 1.1f;
     static constexpr int   kFSize   = 1024;
+
 
     LabLUT() {
         for(int i=0;i<256;++i){
@@ -603,12 +638,15 @@ struct LabLUT {
     }
 };
 
+
 static const LabLUT& lut() noexcept {
     static const LabLUT s_lut;
     return s_lut;
 }
 
+
 struct Lab {float L,a,b;};
+
 
 static Lab rgbToLabLUT(uint32_t c) noexcept {
     const LabLUT& L = lut();
@@ -622,6 +660,7 @@ static Lab rgbToLabLUT(uint32_t c) noexcept {
     float fx=L.f(X), fy=L.f(Y), fz=L.f(Z);
     return{116.f*fy-16.f, 500.f*(fx-fy), 200.f*(fy-fz)};
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  CIEDE2000
@@ -684,15 +723,18 @@ static float ciede2000(const Lab& lab1, const Lab& lab2) noexcept {
         RT * (dCp/(kC*SC)) * (dHp/(kH*SH)));
 }
 
+
 static float ciede2000RGB(uint32_t a, uint32_t b) noexcept {
     return ciede2000(rgbToLabLUT(rgb24(a)), rgbToLabLUT(rgb24(b)));
 }
+
 
 static float labDistSq(uint32_t a,uint32_t b) noexcept {
     Lab la=rgbToLabLUT(rgb24(a)), lb=rgbToLabLUT(rgb24(b));
     float dL=la.L-lb.L, da=la.a-lb.a, db=la.b-lb.b;
     return dL*dL+da*da+db*db;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  PERF-9: linearToSRGB LUT — 4096-entry table replaces std::pow per call
@@ -712,6 +754,7 @@ static const std::array<uint8_t,4096>& linearToSRGBLUT() noexcept {
     return tbl;
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  FIX-C: Post-LCQ chroma amplification
 //
@@ -729,6 +772,7 @@ static const std::array<uint8_t,4096>& linearToSRGBLUT() noexcept {
 // ─────────────────────────────────────────────────────────────────────────────
 static constexpr float kChromaBoostFactor = 1.18f;
 static constexpr float kChromaBoostMinC   = 8.0f;
+
 
 static void boostChromaInPlace(std::vector<uint32_t>& palette) noexcept {
     const auto& srgbLUT = linearToSRGBLUT();
@@ -759,6 +803,7 @@ static void boostChromaInPlace(std::vector<uint32_t>& palette) noexcept {
     }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Lab → sRGB  (PERF-9: uses linearToSRGBLUT instead of std::pow per channel)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -783,11 +828,13 @@ static uint32_t labToRGB(const Lab& lm) noexcept {
     return packRGB(toSRGB(rl), toSRGB(gl), toSRGB(bl));
 }
 
+
 static uint32_t labLerp(uint32_t c0, uint32_t c1, float t) noexcept {
     Lab l0 = rgbToLabLUT(c0), l1 = rgbToLabLUT(c1);
     Lab lm = {l0.L + t*(l1.L-l0.L), l0.a + t*(l1.a-l0.a), l0.b + t*(l1.b-l0.b)};
     return labToRGB(lm);
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Stage 0 — Bilateral Filter (original, unchanged)
@@ -799,9 +846,11 @@ static std::vector<uint8_t> bilateralFilter(
     if (sigma_s < 0.1f)
         return std::vector<uint8_t>(src, src + (size_t)W * H * 4);
 
+
     const float scaledSigma = sigma_s * std::max(1.f, (float)std::max(W,H)/512.f);
     const int radius = std::min((int)std::ceil(2.f*scaledSigma), 5);
     const int D      = 2 * radius + 1;
+
 
     const float inv2Ss2 = 1.f / (2.f * scaledSigma * scaledSigma);
     std::vector<float> spatialW((size_t)D * D);
@@ -810,23 +859,28 @@ static std::vector<uint8_t> bilateralFilter(
             spatialW[(size_t)(dy+radius)*D + (dx+radius)] =
                 std::exp(-(float)(dx*dx+dy*dy) * inv2Ss2);
 
+
     const float inv2Sr2 = 1.f / (2.f * sigma_r * sigma_r);
     float rangeW[256];
     for(int i=0;i<256;++i)
         rangeW[i] = std::exp(-(float)i * inv2Sr2);
 
+
     const int N = W * H;
     std::vector<uint8_t> dst((size_t)N * 4);
+
 
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             const uint8_t* ctr = src + (y * W + x) * 4;
             float sumR=0,sumG=0,sumB=0,sumA=0,sumWt=0;
 
+
             const int y0 = std::max(y - radius, 0);
             const int y1 = std::min(y + radius, H - 1);
             const int x0 = std::max(x - radius, 0);
             const int x1 = std::min(x + radius, W - 1);
+
 
             for (int ny = y0; ny <= y1; ++ny) {
                 for (int nx = x0; nx <= x1; ++nx) {
@@ -844,6 +898,7 @@ static std::vector<uint8_t> bilateralFilter(
                 }
             }
 
+
             uint8_t* d = dst.data() + (y * W + x) * 4;
             if (sumWt > 1e-8f) {
                 d[0]=(uint8_t)std::clamp((int)(sumR/sumWt+.5f),0,255);
@@ -858,10 +913,12 @@ static std::vector<uint8_t> bilateralFilter(
     return dst;
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Median-cut palette helpers (original)
 // ─────────────────────────────────────────────────────────────────────────────
 struct ColorEntry { uint32_t color; int count; };
+
 
 static int widestChannelLab(const std::vector<ColorEntry>& E, int lo, int hi) noexcept {
     float LMn=1e30f,LMx=-1e30f,aMn=1e30f,aMx=-1e30f,bMn=1e30f,bMx=-1e30f;
@@ -874,6 +931,7 @@ static int widestChannelLab(const std::vector<ColorEntry>& E, int lo, int hi) no
     float LR=LMx-LMn, aR=aMx-aMn, bR=bMx-bMn;
     return (LR>=aR && LR>=bR) ? 0 : (aR>=bR) ? 1 : 2;
 }
+
 
 // PERF-ENH-7: medianCutSplit takes pre-allocated scratch buffers by reference,
 // eliminating 3 vector allocations per recursive call (O(K log K) total).
@@ -902,6 +960,7 @@ static int medianCutSplit(std::vector<ColorEntry>& E, int lo, int hi, int labCh,
     return (lo+hi)/2;
 }
 
+
 // AFTER — ENH-COLOR-2a: average in linear RGB, not sRGB.
 // sRGB averaging biases every median-cut centroid 4–8 ΔE dark.
 // Linear average + LUT re-encode gives the perceptually correct midpoint,
@@ -924,6 +983,7 @@ static uint32_t boxRepresentative(const std::vector<ColorEntry>& E, int lo, int 
     };
     return packRGB(toSRGB(rL), toSRGB(gL), toSRGB(bL));
 }
+
 
 static std::vector<uint32_t> medianCutPalette(std::vector<ColorEntry>& E, int target) {
     if (E.empty()) return {};
@@ -972,6 +1032,7 @@ static std::vector<uint32_t> medianCutPalette(std::vector<ColorEntry>& E, int ta
     return pal;
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-1: K-Means++ palette refinement (original, unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -983,6 +1044,7 @@ static std::vector<uint32_t> kMeansPlusPlusRefine(
 {
     int K = (int)initPal.size();
     if (K <= 1 || (int)allEntries.size() <= K) return initPal;
+
 
     struct Centroid { double rL, gL, bL; long count; Lab lab; uint32_t rgb; };
     const LabLUT& L = lut();
@@ -1000,16 +1062,19 @@ static std::vector<uint32_t> kMeansPlusPlusRefine(
         return packRGB(toSRGB(r), toSRGB(g), toSRGB(b));
     };
 
+
     std::vector<Centroid> centroids(K);
     for (int i = 0; i < K; ++i) {
         auto lin = toLinear(initPal[i]);
         centroids[i] = {lin[0], lin[1], lin[2], 0, rgbToLabLUT(initPal[i]), initPal[i]};
     }
 
+
     int ne = (int)allEntries.size();
     std::vector<int> assign(ne, 0);
     std::vector<Lab> entryLab(ne);
     for (int i = 0; i < ne; ++i) entryLab[i] = rgbToLabLUT(allEntries[i].color);
+
 
     // PERF-1: Pre-compute per-entry Lab squared components for fast distance.
     // Assignment uses Lab Euclidean squared (50× cheaper than CIEDE2000).
@@ -1109,11 +1174,13 @@ static std::vector<uint32_t> kMeansPlusPlusRefine(
             centroids[k] = {rL, gL, bL, accCount[k], newLab, newRGB};
         }
 
+
         // ENH-COLOR-2c: tighter convergence lets centroids fully settle,
         // recovering subtle hue separations (e.g. silver body vs grey road) that
         // fall in the 0.3–0.5 ΔE range and were previously abandoned early.
         if (maxMove < 0.3f) break;
     }
+
 
     std::vector<uint32_t> refined;
     refined.reserve(K);
@@ -1123,6 +1190,7 @@ static std::vector<uint32_t> kMeansPlusPlusRefine(
     VT_LOG("ENH-1 K-Means++ refined %d centroids with CIEDE2000 + chroma boost", K);
     return refined;
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-12a — Local Color Quantization (16×16 grid)
@@ -1140,9 +1208,11 @@ static std::vector<uint32_t> kMeansPlusPlusRefine(
 //  happens at palette entry creation (ENH-12e correctness).
 // ═════════════════════════════════════════════════════════════════════════════
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: Per-tile quantization options derived from luminance variance.
 // ─────────────────────────────────────────────────────────────────────────────
+
 
 // Options that vary per tile based on local luminance variance.
 struct TileOptions {
@@ -1150,6 +1220,7 @@ struct TileOptions {
     int filter_speckle  = 1;  // min component area in px
     int min_area        = 1;  // alias of filter_speckle for path-area filter
 };
+
 
 // Step 1: computeTileVariance
 // Compute luminance variance σ² = Σ(Lᵢ − L̄)² / N over CIE L* values for
@@ -1180,6 +1251,7 @@ static float computeTileVariance(
     return std::max(0.0f, variance);
 }
 
+
 // Step 2: varianceToOptions
 // Three-tier mapping: σ² → TileOptions.
 // varFlat / varMid are the tunable thresholds passed in from MultiPassOptions
@@ -1207,6 +1279,7 @@ static TileOptions varianceToOptions(
     return {8, 1, 1};
 }
 
+
 struct TilePalette {
     int   tileX, tileY;           // tile grid coordinates
     int   px0, py0, px1, py1;    // pixel bounds [px0,px1) × [py0,py1)
@@ -1214,6 +1287,7 @@ struct TilePalette {
     std::vector<int>      counts; // ENH-13: per-centroid pixel counts (parallel to colors)
     TileOptions opts;              // ENH-16: per-tile quantization options
 };
+
 
 // Build a per-tile palette using KMeans++ on pixels within each grid cell.
 // The resulting tilePalettes vector contains one entry per non-empty tile.
@@ -1223,6 +1297,7 @@ static std::vector<TilePalette> buildLocalColorQuantization(
     float varFlat = kVarFlat, float varMid = kVarMid)
 {
     const LabLUT& L = lut();
+
 
     auto toLinear = [&](uint32_t c) -> std::array<double,3> {
         return {L.linearise[rCh(c)], L.linearise[gCh(c)], L.linearise[bCh(c)]};
@@ -1238,10 +1313,12 @@ static std::vector<TilePalette> buildLocalColorQuantization(
         return packRGB(toSRGB(r), toSRGB(g), toSRGB(b));
     };
 
+
     // FIX-COLOR-6: Clamp grid so each tile is at least 64x64 pixels.
     // On small images a 16x16 grid produces tiny tiles with poor color stats.
     const int effectiveGridW = std::max(1, std::min(gridW, W / 64));
     const int effectiveGridH = std::max(1, std::min(gridH, H / 64));
+
 
     // PERF-NEW-1: Parallel LCQ tile computation with bounded concurrency.
     // All 256 tile K-means++ runs are fully independent — safe to parallelise.
@@ -1249,17 +1326,20 @@ static std::vector<TilePalette> buildLocalColorQuantization(
     const int HW = std::max(1, (int)std::thread::hardware_concurrency() - 1);
     CountingSemaphore sem(HW);
 
+
     // Pre-allocate result slots so futures can write by tile index (no mutex needed)
     const int totalTiles = effectiveGridW * effectiveGridH;
     std::vector<TilePalette> result(totalTiles);
     std::vector<std::future<void>> tileFuts;
     tileFuts.reserve(totalTiles);
 
+
     for (int ty = 0; ty < effectiveGridH; ++ty) {
         for (int tx = 0; tx < effectiveGridW; ++tx) {
             const int tileIdx = ty * effectiveGridW + tx;
             tileFuts.push_back(std::async(std::launch::async, [&, tx, ty, tileIdx]() {
             sem.acquire();
+
 
             TilePalette tp;
             tp.tileX = tx; tp.tileY = ty;
@@ -1268,10 +1348,12 @@ static std::vector<TilePalette> buildLocalColorQuantization(
             tp.py0 = (ty * H) / effectiveGridH;
             tp.py1 = ((ty + 1) * H) / effectiveGridH;
 
+
             // ENH-16: measure tile luminance variance → per-tile options
             tp.opts = varianceToOptions(
                 computeTileVariance(pixels, W, tp.px0, tp.py0, tp.px1, tp.py1),
                 varFlat, varMid);
+
 
             // Collect pixel frequencies for this tile in Linear RGB space
             std::unordered_map<uint32_t,int> freq;
@@ -1289,17 +1371,21 @@ static std::vector<TilePalette> buildLocalColorQuantization(
                 return;
             }
 
+
             std::vector<ColorEntry> entries;
             entries.reserve(freq.size());
             for (auto& [c, cnt] : freq) entries.push_back({c, cnt});
+
 
             // Initial palette via median-cut
             int target = std::min(colorsPerTile, (int)entries.size());
             std::vector<uint32_t> initPal = medianCutPalette(entries, target);
 
+
             // KMeans++ refinement in Linear RGB (ENH-12e: avoid muddy averages)
             int K = (int)initPal.size();
             if (K == 0) { result[tileIdx] = tp; sem.release(); return; }
+
 
             struct Centroid { double rL, gL, bL; long count; Lab lab; uint32_t rgb; };
             std::vector<Centroid> centroids(K);
@@ -1308,10 +1394,12 @@ static std::vector<TilePalette> buildLocalColorQuantization(
                 centroids[i] = {lin[0], lin[1], lin[2], 0, rgbToLabLUT(initPal[i]), initPal[i]};
             }
 
+
             int ne = (int)entries.size();
             std::vector<int> assign(ne, 0);
             std::vector<Lab> entryLab(ne);
             for (int i = 0; i < ne; ++i) entryLab[i] = rgbToLabLUT(entries[i].color);
+
 
             for (int iter = 0; iter < kKMeansIter; ++iter) {
                 // TRUE-COLOR: Final iteration uses CIEDE2000 for perceptually
@@ -1400,10 +1488,12 @@ static std::vector<TilePalette> buildLocalColorQuantization(
                 if (maxMove < 0.3f) break;
             }
 
+
             tp.colors.reserve(K);
             for (auto& c : centroids) tp.colors.push_back(c.rgb);
             // FIX-C: amplify chroma on saturated per-tile centroids
             boostChromaInPlace(tp.colors);
+
 
             // ENH-13: record per-centroid pixel counts for Pass A weighted blending.
             // accCount[] holds the total pixel weight that converged to each centroid
@@ -1417,6 +1507,7 @@ static std::vector<TilePalette> buildLocalColorQuantization(
                 }
             }
 
+
             result[tileIdx] = std::move(tp);
             sem.release();
             })); // end async lambda
@@ -1425,13 +1516,16 @@ static std::vector<TilePalette> buildLocalColorQuantization(
     // Wait for all tile futures to complete
     for (auto& f : tileFuts) f.get();
 
+
     VT_LOG("ENH-12a LCQ: built %d tiles (%d×%d grid), %d colors/tile",
            (int)result.size(), gridW, gridH, colorsPerTile);
     return result;
 }
 
+
 // Forward declaration — defined below after buildZoneAwarePalette helpers.
 static std::vector<uint32_t> dedupByLabVoxel(const std::vector<uint32_t>& colors, float cellSize);
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-13 Pass A — Cross-Tile Palette Harmonisation
@@ -1460,20 +1554,25 @@ static void stitchAdjacentTilePalettes(
     const int nTiles = (int)tiles.size();
     if (nTiles < 2) return;
 
+
     // Build (tx,ty) → tile index lookup
     // Tiles are stored in row-major order: idx = ty * effectiveGridW + tx
     // We only check right-neighbour (tx+1) and bottom-neighbour (ty+1) to
     // avoid processing each pair twice.
 
+
     const LabLUT& L = lut();
     const auto& srgbLUT = linearToSRGBLUT();
+
 
     for (int idx = 0; idx < nTiles; ++idx) {
         TilePalette& tpA = tiles[idx];
         if (tpA.colors.empty()) continue;
 
+
         const int tx = tpA.tileX;
         const int ty = tpA.tileY;
+
 
         // Check right neighbour and bottom neighbour
         for (int dir = 0; dir < 2; ++dir) {
@@ -1482,8 +1581,10 @@ static void stitchAdjacentTilePalettes(
             int nbIdx = nbTy * effectiveGridW + nbTx;
             if (nbIdx < 0 || nbIdx >= nTiles) continue;
 
+
             TilePalette& tpB = tiles[nbIdx];
             if (tpB.colors.empty()) continue;
+
 
             const std::vector<int>& cntA = (idx < (int)centroidCount.size())
                                            ? centroidCount[idx]
@@ -1491,6 +1592,7 @@ static void stitchAdjacentTilePalettes(
             const std::vector<int>& cntB = (nbIdx < (int)centroidCount.size())
                                            ? centroidCount[nbIdx]
                                            : std::vector<int>{};
+
 
             // For each centroid in tpA, look for a near-match in tpB
             for (int i = 0; i < (int)tpA.colors.size(); ++i) {
@@ -1500,12 +1602,14 @@ static void stitchAdjacentTilePalettes(
                     float de = ciede2000(labA, labB);
                     if (de >= kStitchThresh) continue;
 
+
                     // Compute weighted linear-RGB average
                     int wA = (i < (int)cntA.size() && cntA[i] >= kStitchMinCount)
                              ? cntA[i] : kStitchMinCount;
                     int wB = (j < (int)cntB.size() && cntB[j] >= kStitchMinCount)
                              ? cntB[j] : kStitchMinCount;
                     long total = (long)wA + (long)wB;
+
 
                     double rL = ((double)wA * L.linearise[rCh(tpA.colors[i])]
                                + (double)wB * L.linearise[rCh(tpB.colors[j])]) / total;
@@ -1514,11 +1618,13 @@ static void stitchAdjacentTilePalettes(
                     double bL = ((double)wA * L.linearise[bCh(tpA.colors[i])]
                                + (double)wB * L.linearise[bCh(tpB.colors[j])]) / total;
 
+
                     auto toSRGB = [&](double v) -> uint8_t {
                         int ix = (int)(std::clamp(v, 0.0, 1.0) * 4095.0 + 0.5);
                         return srgbLUT[ix];
                     };
                     uint32_t anchor = packRGB(toSRGB(rL), toSRGB(gLin), toSRGB(bL));
+
 
                     tpA.colors[i] = anchor;
                     tpB.colors[j] = anchor;
@@ -1530,6 +1636,7 @@ static void stitchAdjacentTilePalettes(
     }
     VT_LOG("ENH-13 Pass A: cross-tile palette stitching complete (%d tiles)", nTiles);
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-13 Pass B — Boundary-Pixel Seam Repair
@@ -1553,12 +1660,15 @@ static void repairBoundarySeams(
     static constexpr int ox[4] = {1, -1,  0,  0};
     static constexpr int oy[4] = {0,  0,  1, -1};
 
+
     int repaired = 0;
+
 
     // Cache Lab values to avoid repeated rgbToLabLUT calls for the same colour.
     // Simple direct-mapped cache keyed by rgb24 value.
     std::unordered_map<uint32_t, Lab> labCache;
     labCache.reserve(512);
+
 
     auto getCachedLab = [&](uint32_t c) -> const Lab& {
         auto it = labCache.find(c);
@@ -1566,11 +1676,13 @@ static void repairBoundarySeams(
         return labCache.emplace(c, rgbToLabLUT(c)).first->second;
     };
 
+
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             int idx = y * W + x;
             uint32_t myColor = pixelColor[idx];
             if (myColor == 0xFFFFFFFFu) continue;
+
 
             // Check whether this pixel is a boundary pixel
             bool isBoundary = false;
@@ -1582,10 +1694,12 @@ static void repairBoundarySeams(
             }
             if (!isBoundary) continue;
 
+
             // Find the neighbour colour closest in CIEDE2000 (among different colours)
             float bestDE = kSeamRepairThresh;
             uint32_t bestNeighbour = 0xFFFFFFFFu;
             const Lab& myLab = getCachedLab(myColor);
+
 
             for (int d = 0; d < 4; ++d) {
                 int nx = x + ox[d], ny = y + oy[d];
@@ -1596,6 +1710,7 @@ static void repairBoundarySeams(
                 if (de < bestDE) { bestDE = de; bestNeighbour = nc; }
             }
 
+
             if (bestNeighbour != 0xFFFFFFFFu) {
                 pixelColor[idx] = bestNeighbour;
                 ++repaired;
@@ -1604,6 +1719,7 @@ static void repairBoundarySeams(
     }
     VT_LOG("ENH-13 Pass B: seam repair reclassified %d boundary pixels", repaired);
 }
+
 
 // ENH-12a: Build pixelColor via Local Color Quantization.
 // Returns the union palette (all unique tile colors, deduplicated by ΔE<1).
@@ -1619,13 +1735,16 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
     const int N = W * H;
     pixelColor.assign(N, 0xFFFFFFFFu);
 
+
     std::vector<TilePalette> tiles =
         buildLocalColorQuantization(pixels, W, H, gridW, gridH,
                                     colorsPerTile, varFlat, varMid);
 
+
     // Build tile-lookup grid: for each tile index → TilePalette pointer
     // Arrange tiles[ty*gridW + tx] for fast (x,y) lookup
     // (result of buildLCQ is already in row-major ty*gridW+tx order)
+
 
     // ── ENH-13 Pass A: Cross-tile palette harmonisation ──────────────────
     // Runs BEFORE pixel assignment so every tile's palette already uses the
@@ -1637,12 +1756,15 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
         int egW = 1;
         for (auto& tp : tiles) egW = std::max(egW, tp.tileX + 1);
 
+
         std::vector<std::vector<int>> centroidCount(tiles.size());
         for (size_t ti = 0; ti < tiles.size(); ++ti)
             centroidCount[ti] = tiles[ti].counts;
 
+
         stitchAdjacentTilePalettes(tiles, centroidCount, egW);
     }
+
 
     // Assign each pixel to its tile's nearest palette color
     for (auto& tp : tiles) {
@@ -1651,6 +1773,7 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
         std::vector<Lab> tpLab(tp.colors.size());
         for (size_t i = 0; i < tp.colors.size(); ++i)
             tpLab[i] = rgbToLabLUT(tp.colors[i]);
+
 
         for (int y = tp.py0; y < tp.py1; ++y) {
             for (int x = tp.px0; x < tp.px1; ++x) {
@@ -1676,12 +1799,14 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
         }
     }
 
+
     // ── ENH-13 Pass B: Boundary-pixel seam repair ────────────────────────
     // Reclassifies border pixels where the across-boundary neighbour's colour
     // is within kSeamRepairThresh ΔE.  Heals thin seams that Pass A could not
     // close because they lie inside a majority-colour component rather than on
     // a palette boundary.  Runs in O(W×H) — one forward scan.
     repairBoundarySeams(pixelColor, W, H);
+
 
     // Union palette: collect all tile colors, deduplicate by CIEDE2000 < 1
     std::vector<uint32_t> unionPal;
@@ -1690,11 +1815,13 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
         for (uint32_t c : tp.colors)
             unionPal.push_back(c);
 
+
     // FIX-COLOR-4: Voxel dedup cellSize relaxed from 4.f → 2.f for LCQ union palette.
     // cellSize=4 corresponds to ~ΔE=4 in Lab space, merging visually distinct colours
     // especially in saturated midtone regions. cellSize=2 keeps only near-identical
     // entries (ΔE≈1) while still reducing the 6144-entry union to a manageable set.
     std::vector<uint32_t> dedup = dedupByLabVoxel(unionPal, 2.f); // was 4.f
+
 
     // Collect only colors actually used in pixelColor
     std::unordered_map<uint32_t,bool> used;
@@ -1702,12 +1829,15 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
         if (pixelColor[i] != 0xFFFFFFFFu)
             used[pixelColor[i]] = true;
 
+
     std::vector<uint32_t> finalPal;
     finalPal.reserve(used.size());
     for (auto& [c, _] : used) finalPal.push_back(c);
 
+
     VT_LOG("ENH-12a+ENH-13 LCQ union palette: %d unique colors after stitch+repair",
            (int)finalPal.size());
+
 
     // ENH-16: build the tileOptsGrid array parallel to the tiles vector.
     // Indexed by [ty * effectiveGridW + tx]; the speckle-filter lookup is:
@@ -1730,12 +1860,15 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
         VT_LOG("ENH-16: tileOptsGrid built (%d×%d)", egW, egH);
     }
 
+
     return finalPal;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-12b helpers: pixel extraction for Highlight and Shadow passes
 // ─────────────────────────────────────────────────────────────────────────────
+
 
 // Extract pixels above lStarThresh into a new RGBA buffer (others → alpha=0)
 static std::vector<uint8_t> extractHighlightPixels(
@@ -1756,6 +1889,7 @@ static std::vector<uint8_t> extractHighlightPixels(
     return out;
 }
 
+
 // Extract pixels below lStarThresh (shadows)
 static std::vector<uint8_t> extractShadowPixels(
     const uint8_t* pixels, int W, int H, float lStarThresh)
@@ -1774,6 +1908,7 @@ static std::vector<uint8_t> extractShadowPixels(
     }
     return out;
 }
+
 
 // PERF-ENH-5: Single-pass extraction of both highlight and shadow buffers.
 // Halves Lab conversions and improves cache behaviour vs two sequential scans.
@@ -1801,6 +1936,7 @@ static void extractHighlightAndShadowPixels(
     }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-12c: Adaptive Threshold filter for Pass 3 (Micro-Detail)
 //
@@ -1818,9 +1954,11 @@ static std::vector<uint8_t> adaptiveThresholdHighPass(
     const int N = W * H;
     std::vector<uint8_t> out(static_cast<size_t>(N) * 4, 0);
 
+
     // PERF-ENH-3: Precompute equivalent Lab squared distance threshold once.
     // ΔE=6 ≈ dLabSq≈360 empirically. Avoids 2M CIEDE2000 calls for a binary gate.
     const float labSqThresh = deltaEThresh * deltaEThresh * 10.f; // empirical scale
+
 
     for (int i = 0; i < N; ++i) {
         const uint8_t* p = highPassPixels + i * 4;
@@ -1843,6 +1981,7 @@ static std::vector<uint8_t> adaptiveThresholdHighPass(
     }
     return out;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-12f: Centroid-Based Radial Gradient Fitting
@@ -1869,6 +2008,7 @@ static std::string tryBuildCentroidRadialGradient(
     int bW = x1 - x0 + 1, bH = y1 - y0 + 1;
     if (bW * bH < kRadialGradMinPixels) return "";
 
+
     // Compute centroid and gather (radius, L*) pairs
     double cx = 0, cy = 0; long cnt = 0;
     for (int y = y0; y <= y1; ++y) {
@@ -1879,6 +2019,7 @@ static std::string tryBuildCentroidRadialGradient(
     }
     if (cnt < kRadialGradMinPixels) return "";
     cx /= cnt; cy /= cnt;
+
 
     // Gather (r², L*) pairs; cap sample to 2000
     float maxR2 = 0.f;
@@ -1897,12 +2038,14 @@ static std::string tryBuildCentroidRadialGradient(
     }
     if (maxR2 < 1.f || rL.size() < (size_t)kRadialGradMinPixels) return "";
 
+
     // Subsample to 2000 for speed
     if (rL.size() > 2000) {
         std::mt19937 rng(42);
         std::shuffle(rL.begin(), rL.end(), rng);
         rL.resize(2000);
     }
+
 
     // Compute mean and variance of L* as a function of normalised radius
     // Bin into 4 rings: [0,0.25), [0.25,0.5), [0.5,0.75), [0.75,1]
@@ -1916,10 +2059,12 @@ static std::string tryBuildCentroidRadialGradient(
     for (int b = 0; b < 4; ++b)
         if (ringCnt[b] > 0) ringL[b] /= ringCnt[b];
 
+
     // Check for monotone radial gradient: L* changes consistently with r
     float range = std::max({ringL[0],ringL[1],ringL[2],ringL[3]})
                 - std::min({ringL[0],ringL[1],ringL[2],ringL[3]});
     if (range < 8.f) return ""; // insufficient variance to justify radial grad
+
 
     // Build radialGradient with 4 stops from centre (ring 0) outward (ring 3)
     int gradId = ++gradIdCounter;
@@ -1927,12 +2072,15 @@ static std::string tryBuildCentroidRadialGradient(
     snprintf(idBuf, sizeof(idBuf), "rg%d", gradId);
     outGradId = idBuf;
 
+
     Lab baseLab = rgbToLabLUT(baseColor);
     std::string def;
     def.reserve(512);
 
+
     float cx_svg = (float)cx, cy_svg = (float)cy;
     float radius_svg = std::sqrt(maxR2);
+
 
     char hdr[256];
     snprintf(hdr, sizeof(hdr),
@@ -1941,6 +2089,7 @@ static std::string tryBuildCentroidRadialGradient(
         "gradientUnits=\"userSpaceOnUse\">",
         idBuf, (double)cx_svg, (double)cy_svg, (double)radius_svg);
     def += hdr;
+
 
     // 4 stops at normalised offsets 0, 0.33, 0.66, 1.0
     for (int b = 0; b < 4; ++b) {
@@ -1958,6 +2107,7 @@ static std::string tryBuildCentroidRadialGradient(
     def += "</radialGradient>";
     return def;
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-8 — Region-Aware Quantization
@@ -1979,7 +2129,9 @@ static std::string tryBuildCentroidRadialGradient(
 //   SPECULAR  [92, 100]  — specular hotspots, mirror-like surfaces
 // ═════════════════════════════════════════════════════════════════════════════
 
+
 enum class LumZone : uint8_t { Shadow=0, Midtone=1, Highlight=2, Specular=3 };
+
 
 static LumZone classifyLum(float L) noexcept {
     if (L >= kSpecularLThresh)  return LumZone::Specular;
@@ -1987,6 +2139,7 @@ static LumZone classifyLum(float L) noexcept {
     if (L >= kShadowLThresh)    return LumZone::Midtone;
     return LumZone::Shadow;
 }
+
 
 // Compute per-zone color entry buckets from the pixel frequency table
 static void partitionByZone(
@@ -2000,6 +2153,7 @@ static void partitionByZone(
         zoneEntries[z].push_back(e);
     }
 }
+
 
 // Allocate palette budget across zones proportionally by pixel weight
 static std::array<int,4> allocateBudget(
@@ -2017,6 +2171,7 @@ static std::array<int,4> allocateBudget(
         return {kZoneMinColors, totalBudget - 3*kZoneMinColors, kZoneMinColors, kZoneMinColors};
     }
 
+
     // Fixed-fraction overrides for perceptual importance
     int specularBudget  = std::max(kZoneMinColors, (int)(totalBudget * kSpecularBudgetFrac));
     int highlightBudget = std::max(kZoneMinColors, (int)(totalBudget * kHighlightBudgetFrac));
@@ -2024,10 +2179,12 @@ static std::array<int,4> allocateBudget(
     int midtoneBudget   = std::max(kZoneMinColors,
         totalBudget - specularBudget - highlightBudget - shadowBudget);
 
+
     // Clamp to actual unique colours per zone
     auto clampToUnique = [&](int z, int budget) {
         return std::max(kZoneMinColors, std::min(budget, (int)zoneEntries[z].size()));
     };
+
 
     return {
         clampToUnique(0, shadowBudget),
@@ -2036,6 +2193,7 @@ static std::array<int,4> allocateBudget(
         clampToUnique(3, specularBudget)
     };
 }
+
 
 // PERF-NEW-6: Sort-based Lab voxel deduplication — O(N log N) with no hash overhead.
 // The original 27-neighbour unordered_map probe per color caused ~165,000 cache-missing
@@ -2049,11 +2207,13 @@ static std::vector<uint32_t> dedupByLabVoxel(
 {
     if (colors.empty()) return {};
 
+
     // Pack each color with its voxel key for sorting
     struct Entry {
         uint64_t key;
         uint32_t color;
     };
+
 
     auto voxelKey = [cellSize](const Lab& lab) -> uint64_t {
         uint32_t lk = (uint32_t)std::max(0, (int)(lab.L / cellSize));
@@ -2062,6 +2222,7 @@ static std::vector<uint32_t> dedupByLabVoxel(
         return ((uint64_t)lk << 20) | ((uint64_t)ak << 10) | (uint64_t)bk;
     };
 
+
     std::vector<Entry> entries;
     entries.reserve(colors.size());
     for (uint32_t c : colors) {
@@ -2069,9 +2230,11 @@ static std::vector<uint32_t> dedupByLabVoxel(
         entries.push_back({voxelKey(lab), c});
     }
 
+
     // Sort by voxel key — groups spatially adjacent colors together
     std::sort(entries.begin(), entries.end(),
         [](const Entry& a, const Entry& b) { return a.key < b.key; });
+
 
     // Linear dedup: keep first representative per voxel cluster.
     // Two entries are considered duplicates if their keys are identical or
@@ -2094,6 +2257,7 @@ static std::vector<uint32_t> dedupByLabVoxel(
     return result;
 }
 
+
 // Main ENH-8 palette builder: zone-aware quantization
 static std::vector<uint32_t> buildZoneAwarePalette(
     const std::vector<ColorEntry>& entries,
@@ -2102,13 +2266,17 @@ static std::vector<uint32_t> buildZoneAwarePalette(
     std::array<std::vector<ColorEntry>, 4> zoneEntries;
     partitionByZone(entries, zoneEntries);
 
+
     auto budget = allocateBudget(zoneEntries, targetTotal);
+
 
     VT_LOG("ENH-8 Zone budgets: Shadow=%d Midtone=%d Highlight=%d Specular=%d",
            budget[0], budget[1], budget[2], budget[3]);
 
+
     std::vector<uint32_t> merged;
     merged.reserve((size_t)targetTotal + 8);
+
 
     for (int z = 0; z < 4; ++z) {
         if (zoneEntries[z].empty()) continue;
@@ -2116,9 +2284,11 @@ static std::vector<uint32_t> buildZoneAwarePalette(
         for (auto c : zonePal) merged.push_back(c);
     }
 
+
     // PERF-ENH-6: Voxel-grid dedup replaces O(n²) CIEDE2000 scan.
     // cellSize=8 corresponds roughly to ΔE≈2 perceptual threshold.
     std::vector<uint32_t> dedup = dedupByLabVoxel(merged, 8.f);
+
 
     // If we overshot, consolidate: keep colours with highest coverage
     if ((int)dedup.size() > targetTotal) {
@@ -2142,9 +2312,11 @@ static std::vector<uint32_t> buildZoneAwarePalette(
         dedup.resize(targetTotal);
     }
 
+
     VT_LOG("ENH-8 Zone-aware palette: %d colours (target %d)", (int)dedup.size(), targetTotal);
     return dedup;
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-9 — Gradient Classification and Lighting Inference
@@ -2154,12 +2326,14 @@ static std::vector<uint32_t> buildZoneAwarePalette(
 //  edge-proximity bias, then returns a GradientClass and per-class stop layout.
 // ═════════════════════════════════════════════════════════════════════════════
 
+
 enum class GradientClass : uint8_t {
     Diffuse  = 0,  // broad tonal ramp
     Specular = 1,  // narrow bright peak
     RimLight = 2,  // brightness clustered near boundary
     AOShadow = 3   // darkening toward component boundaries
 };
+
 
 static const char* gradClassStr(GradientClass g) noexcept {
     switch(g){
@@ -2178,6 +2352,7 @@ struct GradientProfile {
     uint32_t        stopColors[3];  // sRGB
     float           x1,y1,x2,y2;   // SVG gradient endpoints
 };
+
 
 // Classify the gradient type from a sorted array of (projection, L*) samples
 // and compute the perceptually correct stop layout.
@@ -2204,6 +2379,7 @@ static GradientProfile classifyAndBuildProfile(
     prof.x2 = std::clamp((float)(mx + tMax * ex), 0.f, (float)(W-1));
     prof.y2 = std::clamp((float)(my + tMax * ey), 0.f, (float)(H-1));
 
+
     int n = (int)projL.size();
     if (n < 4) {
         // Degenerate: return a simple 2-stop diffuse gradient
@@ -2213,6 +2389,7 @@ static GradientProfile classifyAndBuildProfile(
         prof.stopColors[0] = baseColor; prof.stopColors[1] = baseColor;
         return prof;
     }
+
 
     // Compute mean, variance, skewness, kurtosis of L* distribution
     double sumL=0, sumL2=0, sumL3=0, sumL4=0;
@@ -2225,7 +2402,9 @@ static GradientProfile classifyAndBuildProfile(
     double kurt  = (sumL4/n - 4*mean*sumL3/n + 6*mean*mean*sumL2/n
                    - 3*mean*mean*mean*mean) / (var*var) - 3.0; // excess
 
+
     VT_LOG("ENH-9: skew=%.2f kurt=%.2f edgeFrac=%.2f", skew, kurt, (double)edgeFrac);
+
 
     // ── Classification tree ────────────────────────────────────────────────
     if (kurt > kSpecularKurtosisThresh) {
@@ -2238,6 +2417,7 @@ static GradientProfile classifyAndBuildProfile(
         prof.gclass = GradientClass::Diffuse;
     }
 
+
     // ── Stop layout per class ──────────────────────────────────────────────
     // FIX-COLOR-5: Collect L* from actual sampled pixels in each tail.
     // Previous code recomputed rgbToLabLUT(baseColor) per-iteration for a*/b*,
@@ -2246,6 +2426,7 @@ static GradientProfile classifyAndBuildProfile(
     // ratio to preserve hue continuity while reflecting actual dark/light variation.
     int tail = std::max(1, n/7);
     const Lab baseLab_ = rgbToLabLUT(baseColor); // compute once outside loops
+
 
     // --- Dark tail ---
     Lab darkLab = {0, 0, 0};
@@ -2258,6 +2439,7 @@ static GradientProfile classifyAndBuildProfile(
         darkLab.b = baseLab_.b * lRatio;
     }
 
+
     // --- Mid tail ---
     Lab midLab = {0, 0, 0};
     int midCount_ = 0;
@@ -2268,6 +2450,7 @@ static GradientProfile classifyAndBuildProfile(
     midLab.L /= std::max(1, midCount_);
     midLab.a = baseLab_.a * 0.85f;
     midLab.b = baseLab_.b * 0.85f;
+
 
     // --- Light tail ---
     Lab lightLab = {0, 0, 0};
@@ -2281,9 +2464,11 @@ static GradientProfile classifyAndBuildProfile(
         lightLab.b = baseLab_.b * (1.f - 0.7f * desatFactor);
     }
 
+
     uint32_t darkC  = labToRGB(darkLab);
     uint32_t midC   = labToRGB(midLab);
     uint32_t lightC = labToRGB(lightLab);
+
 
     switch (prof.gclass) {
         case GradientClass::Diffuse:
@@ -2294,6 +2479,7 @@ static GradientProfile classifyAndBuildProfile(
             prof.stopColors[0]  = darkC;
             prof.stopColors[1]  = lightC;
             break;
+
 
         case GradientClass::Specular: {
             // 3-stop: dark → bright highlight → dark
@@ -2318,6 +2504,7 @@ static GradientProfile classifyAndBuildProfile(
             break;
         }
 
+
         case GradientClass::RimLight:
             // 3-stop: bright edge → dark centre → bright edge (not representable
             // in SVG linear gradient alone; approximate with bright → dark using
@@ -2331,6 +2518,7 @@ static GradientProfile classifyAndBuildProfile(
             prof.stopColors[2]  = lightC;
             break;
 
+
         case GradientClass::AOShadow:
             // 2-stop: light interior → dark boundary
             prof.numStops       = 2;
@@ -2341,8 +2529,10 @@ static GradientProfile classifyAndBuildProfile(
             break;
     }
 
+
     return prof;
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  Combined Stage 1+2+ENH-1+ENH-8 — Quantise with Zone Awareness
@@ -2356,9 +2546,11 @@ static std::vector<uint32_t> buildPaletteAndAssign(
     const int N = W * H;
     pixelColor.assign(N, 0xFFFFFFFFu);
 
+
     std::unordered_map<uint32_t,int> freq;
     freq.reserve(4096);
     bool anyOpaque = false;
+
 
     std::vector<uint32_t> pixelRaw(N, 0xFFFFFFFFu);
     for(int i=0;i<N;++i){
@@ -2380,23 +2572,29 @@ static std::vector<uint32_t> buildPaletteAndAssign(
         return {};
     }
 
+
     const int targetSz = std::min(1<<std::clamp(opt.color_precision,1,8), kMaxPaletteSize);
     VT_LOG("Stage 1: %d unique colours → target palette %d", (int)freq.size(), targetSz);
+
 
     std::vector<ColorEntry> entries;
     entries.reserve(freq.size());
     for(auto& [c,cnt]:freq) entries.push_back({rgb24(c),cnt});
 
+
     // ENH-8: Use zone-aware palette construction
     std::vector<uint32_t> palette = buildZoneAwarePalette(entries, targetSz);
     if(palette.empty()){VT_WARN("Zone-aware palette returned empty"); return {};}
 
+
     // ENH-1: K-Means++ refinement
     palette = kMeansPlusPlusRefine(palette, entries, W, H, pixelRaw);
+
 
     const int K = (int)palette.size();
     std::vector<Lab> palLab(K);
     for(int i=0;i<K;++i) palLab[i]=rgbToLabLUT(palette[i]);
+
 
     // ENH-2 gradient merge
     UnionFind uf(K);
@@ -2411,6 +2609,7 @@ static std::vector<uint32_t> buildPaletteAndAssign(
             }
         VT_LOG("Stage 2: gradient merge step=%.2f → %d merges", (double)opt.gradient_detect_thresh, merges);
     }
+
 
     // AFTER — ENH-COLOR-2b: accumulate in linear RGB so gradient-merged group
     // colours are perceptually correct midpoints, not gamma-biased sRGB averages.
@@ -2437,6 +2636,7 @@ static std::vector<uint32_t> buildPaletteAndAssign(
         rootColor[root]=packRGB(toSRGB(acc.rL), toSRGB(acc.gL), toSRGB(acc.bL));
     }
 
+
     std::unordered_map<uint32_t,uint32_t> nearestCache;
     nearestCache.reserve(freq.size()*2);
     auto nearest=[&](uint32_t c)->uint32_t{
@@ -2455,10 +2655,12 @@ static std::vector<uint32_t> buildPaletteAndAssign(
         return res;
     };
 
+
     for(int i=0;i<N;++i){
         if(pixelRaw[i]==0xFFFFFFFFu) continue;
         pixelColor[i]=nearest(pixelRaw[i]);
     }
+
 
     // ENH-1: Spatial superpixel smoothing
     {
@@ -2491,6 +2693,7 @@ static std::vector<uint32_t> buildPaletteAndAssign(
         VT_LOG("ENH-1: spatial superpixel smoothing pass done (R=%d)", R);
     }
 
+
     std::unordered_map<uint32_t,bool> seen;
     std::vector<uint32_t> used;
     for(int i=0;i<N;++i){
@@ -2499,9 +2702,11 @@ static std::vector<uint32_t> buildPaletteAndAssign(
             used.push_back(pixelColor[i]);
     }
 
+
     VT_LOG("Stage 1+2+ENH-1+ENH-8: %d colours in use", (int)used.size());
     return used;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stage 3 — BFS connected-component labelling (original)
@@ -2521,6 +2726,7 @@ static std::vector<int> labelComponents(
     // on ARM Cortex-A cores where integer division is ~20-40 cycles.
     struct QEntry { int idx, x, y; };
     std::vector<QEntry> q; q.reserve(2048);
+
 
     for(int i=0;i<N;++i){
         if(pixelColor[i]==0xFFFFFFFFu||label[i]!=-1) continue;
@@ -2549,6 +2755,7 @@ static std::vector<int> labelComponents(
     }
     return label;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stage 4 — Speckle-filter BFS clear (original)
@@ -2579,6 +2786,7 @@ static void clearComponent(
     }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stage 5 — Shared edge graph (original)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2601,6 +2809,7 @@ struct SharedEdgeGraph {
     }
 };
 
+
 static SharedEdgeGraph buildEdgeGraph(
     const std::vector<uint32_t>& pixelColor, int W, int H)
 {
@@ -2619,6 +2828,7 @@ static SharedEdgeGraph buildEdgeGraph(
         }
     return graph;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-6 — Micro-Cluster Suppression (original)
@@ -2671,6 +2881,7 @@ static bool shouldSuppressComponent(
     return true;
 }
 
+
 // ENH-12 variant: relaxed micro-suppression for detail/texture passes.
 // Uses kDetailMicroClusterAbsMax and kDetailMicroClusterAreaFrac so that
 // fine veins, pollen grains and petal textures are preserved.
@@ -2722,6 +2933,7 @@ static bool shouldSuppressComponentDetail(
     if (frac >= kDetailMicroClusterAreaFrac) return false;
     return true;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stage 6 — Moore boundary trace (original)
@@ -2777,6 +2989,7 @@ static bool shouldSuppressComponentDetail(
 }
  
 
+
 static void snapToSharedEdges(
     std::vector<Point>& path,
     const std::vector<uint32_t>& pixelColor,
@@ -2811,6 +3024,7 @@ static void snapToSharedEdges(
     }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stages 7–9 — RDP, Corner detection, Bézier fitting (original, unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2822,6 +3036,7 @@ static float ptSegDistSq(const Point& p,const Point& a,const Point& b) noexcept 
     float qx=a.x+t*dx-p.x, qy=a.y+t*dy-p.y;
     return qx*qx+qy*qy;
 }
+
 
 [[nodiscard]] static std::vector<Point> rdpSimplify(
     const std::vector<Point>& pts, float eps) noexcept
@@ -2853,6 +3068,7 @@ static float ptSegDistSq(const Point& p,const Point& a,const Point& b) noexcept 
     return out;
 }
 
+
 [[nodiscard]] static std::vector<uint8_t> detectCorners(
     const std::vector<Point>& pts, float thresh_deg) noexcept
 {
@@ -2875,6 +3091,7 @@ static float ptSegDistSq(const Point& p,const Point& a,const Point& b) noexcept 
     return c;
 }
 
+
 static Point bezier(const Point& P0,const Point& P1,
                     const Point& P2,const Point& P3,float t) noexcept {
     float mt=1.f-t;
@@ -2882,6 +3099,7 @@ static Point bezier(const Point& P0,const Point& P1,
     return{b0*P0.x+b1*P1.x+b2*P2.x+b3*P3.x,
            b0*P0.y+b1*P1.y+b2*P2.y+b3*P3.y};
 }
+
 
 [[nodiscard]] static std::vector<float> chordParam(
     const std::vector<Point>& pts, int lo, int hi) noexcept
@@ -2898,7 +3116,9 @@ static Point bezier(const Point& P0,const Point& P1,
     return u;
 }
 
+
 struct CubicFit{Point P1,P2;float maxResidSq;};
+
 
 static std::pair<Point,Point> catmullRomFallback(
     const Point& P0, const Point& P3) noexcept
@@ -2913,6 +3133,7 @@ static std::pair<Point,Point> catmullRomFallback(
     return{{P0.x+tx*c, P0.y+ty*c},
            {P3.x-tx*c, P3.y-ty*c}};
 }
+
 
 static CubicFit fitCubicSegment(
     const std::vector<Point>& raw, int lo, int hi,
@@ -3005,6 +3226,7 @@ static CubicFit fitCubicSegment(
     return{P1,P2,maxRes};
 }
 
+
 [[nodiscard]] static std::vector<float> reparameterise(
     const std::vector<Point>& raw, int lo, int hi,
     const Point& P0, const Point& P1,
@@ -3028,6 +3250,7 @@ static CubicFit fitCubicSegment(
     return u2;
 }
 
+
 static Point estimateTangent(const std::vector<Point>& pts, int idx, int hw) noexcept {
     int n = (int)pts.size();
     hw = std::min(hw, std::max(1, n/4));
@@ -3035,6 +3258,7 @@ static Point estimateTangent(const std::vector<Point>& pts, int idx, int hw) noe
     const Point& next = pts[(idx + hw) % n];
     return normalize({next.x - prev.x, next.y - prev.y});
 }
+
 
 static void fitBezierRecursive(
     const std::vector<Point>& raw, int lo, int hi,
@@ -3112,6 +3336,7 @@ static void fitBezierRecursive(
     }
 }
 
+
 static int detectWrapDiscontinuity(const std::vector<Point>& seg) noexcept {
     const int n=(int)seg.size();
     if(n<3) return -1;
@@ -3127,6 +3352,7 @@ static int detectWrapDiscontinuity(const std::vector<Point>& seg) noexcept {
     float mean=sumD2/cnt;
     return (maxD2>9.f*mean) ? maxIdx : -1;
 }
+
 
 [[nodiscard]] static std::vector<Segment> buildSplineLSQ(
     const std::vector<Point>& keyPts,
@@ -3211,6 +3437,7 @@ static int detectWrapDiscontinuity(const std::vector<Point>& seg) noexcept {
     return segs;
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stage 10 — Winding-order normalisation (original)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3242,10 +3469,12 @@ static bool pointInPolygon(const std::vector<Point>& poly, float px, float py) n
     return inside;
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-2 + Gradient definitions (original + extended for ENH-9 multi-stop)
 // ─────────────────────────────────────────────────────────────────────────────
 struct GradStop { uint32_t color; float offset; };
+
 
 struct GradientDef {
     int   id;
@@ -3255,6 +3484,7 @@ struct GradientDef {
     std::vector<GradStop>  stops;
     std::vector<uint32_t>  colors;
 };
+
 
 static std::vector<GradientDef> buildGradientDefs(
     const std::vector<uint32_t>& palette,
@@ -3268,6 +3498,7 @@ static std::vector<GradientDef> buildGradientDefs(
     if(K<2) return {};
     const float thresh2=gradThresh*gradThresh;
 
+
     UnionFind uf(K);
     for(int i=0;i<K;++i)
         for(int j=i+1;j<K;++j)
@@ -3275,11 +3506,14 @@ static std::vector<GradientDef> buildGradientDefs(
                edgeGraph.hasEdge(palette[i],palette[j]))
                 uf.unite(i,j);
 
+
     std::unordered_map<int,std::vector<int>> groups;
     for(int i=0;i<K;++i) groups[uf.find(i)].push_back(i);
 
+
     std::vector<GradientDef> defs;
     int gradId=0;
+
 
     for(auto& [root,members]:groups){
         if((int)members.size()<2) continue;
@@ -3299,13 +3533,16 @@ static std::vector<GradientDef> buildGradientDefs(
         }
         if(ux0==INT_MAX) continue;
 
+
         GradientDef def;
         def.id=++gradId;
         def.isRadial = false;
         def.cx=def.cy=def.r=0.f;
 
+
         float bw = (float)(ux1 - ux0);
         float bh = (float)(uy1 - uy0);
+
 
         int hEdges=0, vEdges=0;
         for(int mi=0;mi<(int)members.size();++mi){
@@ -3320,6 +3557,7 @@ static std::vector<GradientDef> buildGradientDefs(
                 }
             }
         }
+
 
         float aspect = bw > 0 && bh > 0 ? std::max(bw,bh)/std::min(bw,bh) : 1.f;
         if (aspect < 1.3f && bw > 4 && bh > 4) {
@@ -3349,6 +3587,7 @@ static std::vector<GradientDef> buildGradientDefs(
             }
         }
 
+
         int nm=(int)members.size();
         if (nm >= 2) {
             std::vector<float> cumDE(nm, 0.f);
@@ -3371,6 +3610,7 @@ static std::vector<GradientDef> buildGradientDefs(
     }
     return defs;
 }
+
 
 static void collectGradientDefsStr(std::string& out, const std::vector<GradientDef>& defs) {
     for(auto& def:defs){
@@ -3400,6 +3640,7 @@ static void collectGradientDefsStr(std::string& out, const std::vector<GradientD
     }
 }
 
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-7+9 — Per-Cluster PCA Gradient with Lighting Classification
 //
@@ -3421,6 +3662,7 @@ struct ClusterGradResult {
     float          hotspotX, hotspotY;
 };
 
+
 static ClusterGradResult inferClusterGradClassified(
     const uint8_t* src,
     const std::vector<int>& labelMap,
@@ -3434,20 +3676,25 @@ static ClusterGradResult inferClusterGradClassified(
     res.valid = false;
     res.gclass = GradientClass::Diffuse;
 
+
     const int bx0=bbox[0], by0=bbox[1], bx1=bbox[2], by1=bbox[3];
     const int bw=bx1-bx0+1, bh=by1-by0+1;
     if (bw < 3 || bh < 3) return res;
+
 
     int pixCount = 0;
     for (int y=by0; y<=by1; ++y)
         for (int x=bx0; x<=bx1; ++x)
             if (labelMap[y*W+x] == lbl) ++pixCount;
 
+
     if (pixCount < kClusterGradMinPixels) return res;
+
 
     const int kSubStep = (pixCount > kClusterGradMaxSample)
                          ? (int)std::ceil((float)pixCount / kClusterGradMaxSample)
                          : 1;
+
 
     // Pass 1: centroid
     double sumX=0, sumY=0; int count=0, skip=0;
@@ -3459,7 +3706,9 @@ static ClusterGradResult inferClusterGradClassified(
         }
     if (count < 4) return res;
 
+
     const double mx = sumX/count, my = sumY/count;
+
 
     // Pass 2: covariance
     double cxx=0, cxy=0, cyy=0;
@@ -3473,6 +3722,7 @@ static ClusterGradResult inferClusterGradClassified(
         }
     cxx/=count; cxy/=count; cyy/=count;
 
+
     // PCA eigenvector
     double halfTrace=(cxx+cyy)*0.5;
     double disc=std::sqrt(std::max(0.0,(cxx-cyy)*(cxx-cyy)*0.25+cxy*cxy));
@@ -3482,11 +3732,13 @@ static ClusterGradResult inferClusterGradClassified(
     if (elen<1e-8){ex=1.0; ey=1.0; elen=std::sqrt(2.0);}
     ex/=elen; ey/=elen;
 
+
     // Pass 3: project onto axis, collect (proj, L*)
     // Also track edge-proximity: pixels within 15% of bbox boundary
     const float edgePad = 0.15f;
     const int exBound = (int)(edgePad * bw);
     const int eyBound = (int)(edgePad * bh);
+
 
     struct ProjSample { float t; float Lstar; bool nearEdge; };
     std::vector<ProjSample> samples;
@@ -3506,12 +3758,15 @@ static ClusterGradResult inferClusterGradClassified(
         }
     if ((int)samples.size() < 4) return res;
 
+
     std::sort(samples.begin(), samples.end(), [](const ProjSample& a, const ProjSample& b){
         return a.t < b.t;
     });
 
+
     float tMin = samples.front().t;
     float tMax = samples.back().t;
+
 
     // Compute edge-proximity bias: fraction of bright pixels near the edge
     int edgeCount=0, brightNearEdge=0;
@@ -3526,14 +3781,17 @@ static ClusterGradResult inferClusterGradClassified(
     }
     float edgeFrac = edgeCount > 0 ? (float)brightNearEdge / edgeCount : 0.f;
 
+
     // Build (proj, L*) pairs for classification
     std::vector<std::pair<float,float>> projL;
     projL.reserve(samples.size());
     for (auto& s : samples) projL.push_back({s.t, s.Lstar});
 
+
     // ENH-9: classify and build multi-stop gradient profile
     GradientProfile prof = classifyAndBuildProfile(
         projL, edgeFrac, mx, my, ex, ey, tMin, tMax, W, H, baseColor);
+
 
     // Verify perceptual difference across stops justifies a gradient
     float maxDE = 0.f;
@@ -3541,8 +3799,10 @@ static ClusterGradResult inferClusterGradClassified(
         maxDE = std::max(maxDE, ciede2000RGB(prof.stopColors[i], prof.stopColors[i+1]));
     if (maxDE < deThresh) return res;
 
+
     VT_LOG("ENH-9: cluster lbl=%d class=%s maxDE=%.1f stops=%d",
            lbl, gradClassStr(prof.gclass), (double)maxDE, prof.numStops);
+
 
     res.valid    = true;
     res.gclass   = prof.gclass;
@@ -3553,6 +3813,7 @@ static ClusterGradResult inferClusterGradClassified(
         res.stopOffsets[i] = prof.stopOffsets[i];
         res.stopColors[i]  = prof.stopColors[i];
     }
+
 
     // Specular hotspot: peak-L* position in SVG space
     if (prof.gclass == GradientClass::Specular) {
@@ -3566,8 +3827,10 @@ static ClusterGradResult inferClusterGradClassified(
         res.hotspotY = (res.gy1 + res.gy2) * 0.5f;
     }
 
+
     return res;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stage 11 — SVG output helpers (original)
@@ -3581,6 +3844,7 @@ static void appendFloat(std::string& s, float v, int dp) {
     }
     s.append(buf,len);
 }
+
 
 static void appendSegmentRel(
     std::string& d, const Segment& seg, const Point& prev, int dp)
@@ -3601,6 +3865,7 @@ static void appendSegmentRel(
     }
 }
 
+
 static void appendColorHex(std::string& s, uint32_t c) {
     c=rgb24(c);
     uint8_t r=rCh(c), g=gCh(c), b=bCh(c);
@@ -3612,6 +3877,7 @@ static void appendColorHex(std::string& s, uint32_t c) {
     s+=buf;
 }
 
+
 struct PathRecord {
     std::vector<Point>   rawPts;
     std::vector<Point>   pts;
@@ -3619,6 +3885,7 @@ struct PathRecord {
     bool                 isHole;
     int                  compLabel;
 };
+
 
 // ENH-4: Path Dilation (original, unchanged)
 static std::vector<Point> dilateContour(
@@ -3648,6 +3915,7 @@ static std::vector<Point> dilateContour(
     }
     return out;
 }
+
 
 [[nodiscard]] static std::string buildPathD(
     const PathRecord& pr, int dp, bool applyDilation = true)
@@ -3682,6 +3950,7 @@ static std::vector<Point> dilateContour(
     return d;
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-4b: Contracted path for rim-light inset overlay
 //  Scales all points inward from the centroid by kRimContractFrac
@@ -3695,12 +3964,14 @@ static std::vector<Point> dilateContour(
     for (auto& p : pr.pts) { cx+=p.x; cy+=p.y; }
     cx /= pr.pts.size(); cy /= pr.pts.size();
 
+
     // Contract each point toward centroid
     std::vector<Point> contracted(pr.pts.size());
     for (size_t i=0; i<pr.pts.size(); ++i) {
         contracted[i].x = cx + (pr.pts[i].x - cx) * contractFrac;
         contracted[i].y = cy + (pr.pts[i].y - cy) * contractFrac;
     }
+
 
     // Build a simple polygon path from contracted points (no Bézier refitting)
     if (contracted.empty()) return {};
@@ -3716,6 +3987,7 @@ static std::vector<Point> dilateContour(
     d += 'Z';
     return d;
 }
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-10 — Artistic Gradient Overlays
@@ -3736,6 +4008,7 @@ struct OverlayRecord {
     uint32_t      lightColor;   // brightest stop colour
 };
 
+
 static void emitOverlays(
     std::string& svg,
     std::string& allGradDefs,
@@ -3744,6 +4017,7 @@ static void emitOverlays(
     int& gradCounter)
 {
     if (overlays.empty() && W == 0) return;
+
 
     // ── (c) Global AO vignette def ─────────────────────────────────────────
     // A full-canvas radial gradient, dark at corners, transparent at centre
@@ -3762,16 +4036,20 @@ static void emitOverlays(
         allGradDefs += aoDef;
     }
 
+
     // ── Per-component overlay defs ─────────────────────────────────────────
     struct OverlayDef { int id; GradientClass gc; };
     std::vector<OverlayDef> overlayDefIds;
     overlayDefIds.reserve(overlays.size());
 
+
     for (auto& ov : overlays) {
         int oid = ++gradCounter;
         overlayDefIds.push_back({oid, ov.gclass});
 
+
         float rHotspot = std::max(ov.bboxW, ov.bboxH) * 0.35f;
+
 
         if (ov.gclass == GradientClass::Specular) {
             // Radial gradient centred on hotspot, from brightened lightColor → transparent
@@ -3800,6 +4078,7 @@ static void emitOverlays(
                 lr, lg, lb);
             allGradDefs += defBuf;
 
+
         } else if (ov.gclass == GradientClass::RimLight) {
             // Linear gradient bright-edge → transparent for rim stroke
             uint8_t lr = rCh(ov.lightColor), lg = gCh(ov.lightColor), lb = bCh(ov.lightColor);
@@ -3819,8 +4098,10 @@ static void emitOverlays(
         }
     }
 
+
     // ── Overlay path elements ──────────────────────────────────────────────
     svg += "<g pointer-events=\"none\">";
+
 
     // (a) Specular overlays
     for (size_t i=0; i<overlays.size(); ++i) {
@@ -3836,6 +4117,7 @@ static void emitOverlays(
         svg += ov.pathD;
         svg += "\"/>";
     }
+
 
     // (b) Rim-light overlays
     for (size_t i=0; i<overlays.size(); ++i) {
@@ -3854,6 +4136,7 @@ static void emitOverlays(
         svg += "\"/>";
     }
 
+
     // (c) Global AO vignette — full-canvas rect with multiply blend
     {
         char aoPath[256];
@@ -3865,9 +4148,11 @@ static void emitOverlays(
         svg += aoPath;
     }
 
+
     svg += "</g>";
     VT_LOG("ENH-10: emitted %zu overlay(s) + global AO vignette", overlays.size());
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Public entry point
@@ -3882,6 +4167,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
     const double t0=vt_now_ms();
     VT_LOG("vectorize: start %dx%d (%d px)",width,height,width*height);
 
+
     // Apply defaults
     if(options.color_precision <=0) options.color_precision =kDefaultColorPrecision;
     if(options.corner_threshold<=0) options.corner_threshold=kDefaultCornerThreshold;
@@ -3893,10 +4179,13 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
     if(options.bilateral_sigma_r<=0) options.bilateral_sigma_r=30.f;
     if(options.gradient_detect_thresh<=0) options.gradient_detect_thresh=kGradDetectDefault;
 
+
     VT_LOG("vectorize: ENH-8(zone-quant) ENH-9(grad-classify) ENH-10(art-overlay) enabled");
+
 
     const int dp = std::clamp(options.path_precision, 0, 6);
     const int N  = width * height;
+
 
     // ── Stage 0: Bilateral pre-filter ────────────────────────────────────
     double ts=vt_now_ms();
@@ -3906,6 +4195,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
     VT_LOG("Stage 0 (bilateral): %.1f ms", vt_now_ms()-ts);
     const uint8_t* src=blurred.data();
 
+
     // ── Stages 1+2+ENH-1+ENH-8: quantise ────────────────────────────────
     ts=vt_now_ms();
     std::vector<uint32_t> pixelColor;
@@ -3913,6 +4203,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         buildPaletteAndAssign(src,width,height,options,pixelColor);
     VT_LOG("Stage 1+2+ENH-1+ENH-8 (zone-quant+kmeans++): %.1f ms, palette=%d",
            vt_now_ms()-ts,(int)palette.size());
+
 
     if(palette.empty()){
         char buf[128];
@@ -3923,6 +4214,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         return buf;
     }
 
+
     // ── Stage 3: connected components ────────────────────────────────────
     ts=vt_now_ms();
     std::vector<uint32_t> componentColor;
@@ -3932,6 +4224,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         labelComponents(pixelColor,width,height,
                          componentColor,componentSize,componentBBox);
     VT_LOG("Stage 3: %.1f ms, %d components", vt_now_ms()-ts,(int)componentColor.size());
+
 
     // ── ENH-14: Dominant-Color Resampling (Lab voxel mode + intra-voxel sRGB mode)
     //
@@ -3982,10 +4275,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         const int    N14  = width * height;
         const int    nC   = (int)componentColor.size();
 
+
         static constexpr float kLabVoxelCell = 4.0f;
         static constexpr int   kLbins = 25;   // L*  [0,100]   → 25 bins
         static constexpr int   kAbins = 64;   // a*  [-128,127] → 64 bins
         static constexpr int   kBbins = 64;   // b*  [-128,127] → 64 bins
+
 
         // Pack (lBin, aBin, bBin) into a uint32_t voxel key.
         // Layout: bits [16:12] = lBin (5 bits), [11:6] = aBin (6 bits), [5:0] = bBin (6 bits).
@@ -3994,6 +4289,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                    (static_cast<uint32_t>(aBin) <<  6) |
                     static_cast<uint32_t>(bBin);
         };
+
 
         // Per-component, per-voxel accumulator.
         //   VoxelEntry.count    — total pixels binned into this voxel (Level 1)
@@ -4007,16 +4303,20 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             static_cast<size_t>(nC));
         for (auto& m : compVoxels) m.reserve(16);
 
+
         // ── Single pass: accumulate both histogram levels simultaneously ──────
         for (int i = 0; i < N14; ++i) {
             const int lbl = labelMap[i];
             if (lbl < 0 || lbl >= nC) continue;
 
+
             const uint8_t* p = pixels + i * 4;
             if (p[3] == 0) continue;
 
+
             const uint32_t origRGB = packRGB(p[0], p[1], p[2]);
             const Lab      lab     = rgbToLabLUT(origRGB);
+
 
             const int lBin = std::clamp(static_cast<int>(lab.L / kLabVoxelCell),
                                         0, kLbins - 1);
@@ -4025,15 +4325,18 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             const int bBin = std::clamp(
                 static_cast<int>((lab.b + 128.0f) / kLabVoxelCell), 0, kBbins - 1);
 
+
             VoxelEntry& entry = compVoxels[lbl][makeVoxelKey(lBin, aBin, bBin)];
             ++entry.count;               // Level 1: voxel total
             ++entry.srgbFreq[origRGB];  // Level 2: exact sRGB frequency within voxel
         }
 
+
         // ── Per-component: dominant voxel → most-frequent exact sRGB ─────────
         for (int lbl = 0; lbl < nC; ++lbl) {
             const auto& voxels = compVoxels[lbl];
             if (voxels.empty()) continue;
+
 
             // Step 1: find the voxel with the highest total pixel count (Level 1).
             const VoxelEntry* bestEntry = nullptr;
@@ -4045,6 +4348,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 }
             }
             if (!bestEntry || bestEntry->srgbFreq.empty()) continue;
+
 
             // Step 2: within the winning voxel, find the most-frequent actual sRGB
             //         value (Level 2) — bit-exact to a pixel in the original image.
@@ -4060,15 +4364,18 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             componentColor[lbl] = bestRGB;
         }
 
+
         VT_LOG("ENH-14 (dominant-color resample, intra-voxel sRGB mode): %.1f ms, "
                "%d components → exact source pixels", vt_now_ms() - ts14, nC);
     }
     // ── end ENH-14 ───────────────────────────────────────────────────────────────────────────
 
+
     std::unordered_map<uint32_t,std::vector<int>> colorToComponents;
     colorToComponents.reserve(palette.size()*2);
     for(int lbl=0;lbl<(int)componentColor.size();++lbl)
         colorToComponents[componentColor[lbl]].push_back(lbl);
+
 
     // ── ENH-5: Topological Z-Order ────────────────────────────────────────
     {
@@ -4077,9 +4384,11 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         for(int lbl=0;lbl<(int)componentColor.size();++lbl)
             colorTotalArea[componentColor[lbl]] += componentSize[lbl];
 
+
         std::stable_sort(palette.begin(),palette.end(),[&](uint32_t a,uint32_t b){
             return colorTotalArea[a] > colorTotalArea[b];
         });
+
 
         int K = (int)palette.size();
         std::vector<std::array<int,4>> colorUnionBBox(K,
@@ -4087,6 +4396,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         std::unordered_map<uint32_t,int> colorPalIdx;
         colorPalIdx.reserve(K*2);
         for(int i=0;i<K;++i) colorPalIdx[palette[i]]=i;
+
 
         for(int lbl=0;lbl<(int)componentColor.size();++lbl){
             auto it=colorPalIdx.find(componentColor[lbl]);
@@ -4098,7 +4408,9 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             ub[2]=std::max(ub[2],bb[2]); ub[3]=std::max(ub[3],bb[3]);
         }
 
+
  
+
 
         for(int i=0;i<K;++i){
             const auto& bA=colorUnionBBox[i];
@@ -4114,6 +4426,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         }
         VT_LOG("ENH-5: z-order complete (%d colours)", K);
     }
+
 
     // ── Stage 4b: Watertight hole fill ────────────────────────────────────
     // FIX-HOLES: clearComponent() sets occ[i]=0 for speckle/suppressed pixels
@@ -4161,10 +4474,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                vt_now_ms() - ts, hFilled);
     }
 
+
     // ── Stage 5: shared edge graph ────────────────────────────────────────
     ts=vt_now_ms();
     SharedEdgeGraph edgeGraph=buildEdgeGraph(pixelColor,width,height);
     VT_LOG("Stage 5 (edge graph): %.1f ms", vt_now_ms()-ts);
+
 
     // ── ENH-2: Gradient group detection ──────────────────────────────────
     std::vector<GradientDef> gradDefs;
@@ -4179,20 +4494,26 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         VT_LOG("ENH-2: %d gradient groups detected", (int)gradDefs.size());
     }
 
+
     // ── Gradient defs string accumulator (ENH-2 + ENH-9 + ENH-10) ────────
     std::string allGradDefs;
     collectGradientDefsStr(allGradDefs, gradDefs);
+
 
     // ── Path and overlay accumulators ─────────────────────────────────────
     std::string paths_svg;
     paths_svg.reserve((size_t)N * 6);
 
+
     std::vector<OverlayRecord> overlayRecords; // ENH-10
+
 
     // Gradient counter starts after ENH-2 IDs
     int clusterGradCounter = (int)gradDefs.size();
 
+
     std::unordered_map<int,std::vector<std::string>> gradPathDsList;
+
 
     std::vector<uint8_t> occ(N, 0);
     // PERF-ENH-2 (PERF-3 fix): Track dirty pixel indices to avoid O(N) std::fill
@@ -4205,13 +4526,16 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
     std::vector<int> occDirty;
     occDirty.reserve(std::min(N / 4, 1 << 20)); // cap at 1M entries initially
 
+
     int totalPaths=0, totalSpeckles=0, totalTracerMaxStepHits=0;
     int totalMicroSuppressed=0, totalClusterGrads=0, totalRectFallbacks=0;
     double timeTrace=0, timeRDP=0, timeBezier=0, timeSVG=0;
 
+
     // ── Stages 4–11: per-colour processing ───────────────────────────────
     for(uint32_t color : palette){
         if(!colorToComponents.count(color)) continue;
+
 
         // PERF-ENH-2: Reset only previously dirty pixels (O(dirty) not O(N))
         for (int di : occDirty) occ[di] = 0;
@@ -4219,12 +4543,15 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         for(int i=0;i<N;++i)
             if(pixelColor[i]==color){ occ[i]=1; occDirty.push_back(i); }
 
+
         std::vector<PathRecord> paths;
+
 
         // ENH-BBOX-FALLBACK (Step 1): track labels that pass all filters and
         // reach traceBoundary.  Labels present here but absent from emittedLabels
         // at SVG-emit time are candidates for axis-aligned <rect> fallbacks.
         std::unordered_set<int> survivedLabels;
+
 
         for(int y=0;y<height;++y){
             for(int x=0;x<width;++x){
@@ -4232,10 +4559,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 if(occ[idx]!=1) continue;
                 int lbl=labelMap[idx];
 
+
                 if(componentSize[lbl]<options.filter_speckle){
                     clearComponent(idx,lbl,labelMap,occ,width,height);
                     ++totalSpeckles; continue;
                 }
+
 
                 // ENH-12-FIX: For LCQ/detail passes (filter_speckle <= 1), use the
                 // relaxed shouldSuppressComponentDetail which preserves small chromatic
@@ -4269,7 +4598,9 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                     }
                 }
 
+
                 int compMaxSteps=std::min(componentSize[lbl]*8+16, N+8);
+
 
                 // ENH-BBOX-FALLBACK (Step 2): component has survived both the
                 // speckle filter and micro-suppression; record it so we can
@@ -4277,31 +4608,38 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 // later silently drops it.
                 survivedLabels.insert(lbl);
 
+
                 double tTrace=vt_now_ms();
                 std::vector<Point> raw=traceBoundary(
                     x,y,width,height,occ,compMaxSteps);
                 timeTrace+=vt_now_ms()-tTrace;
+
 
                 if((int)raw.size()>=compMaxSteps-1)
                     ++totalTracerMaxStepHits;
                 clearComponent(idx,lbl,labelMap,occ,width,height);
                 if((int)raw.size()<3) continue;
 
+
                 snapToSharedEdges(raw,pixelColor,color,width,height);
+
 
                 double tRDP=vt_now_ms();
                 std::vector<Point> simplified=rdpSimplify(raw,options.rdp_epsilon);
                 timeRDP+=vt_now_ms()-tRDP;
                 if((int)simplified.size()<3) continue;
 
+
                 std::vector<uint8_t> corners=
                     detectCorners(simplified,options.corner_threshold);
+
 
                 double tBez=vt_now_ms();
                 std::vector<Segment> segs=
                     buildSplineLSQ(simplified,corners,raw,options.fit_tolerance);
                 timeBezier+=vt_now_ms()-tBez;
                 if(segs.empty()) continue;
+
 
                 paths.push_back({std::move(raw),std::move(simplified),
                                  std::move(segs),false,lbl});
@@ -4312,6 +4650,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         // is empty (tracer/RDP/Bézier dropped everything) we still fall through
         // to emit axis-aligned <rect> fallbacks below.
         if(paths.empty() && survivedLabels.empty()) continue;
+
 
         // Stage 10: hole detection + winding order
         struct BBox{float x0,y0,x1,y1;};
@@ -4327,6 +4666,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             return i.x0>=o.x0&&i.y0>=o.y0&&i.x1<=o.x1&&i.y1<=o.y1;
         };
 
+
         std::vector<BBox> bboxes;
         bboxes.reserve(paths.size());
         for(auto& pr:paths) bboxes.push_back(getBBox(pr.pts));
@@ -4337,6 +4677,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             float bA=(bboxes[b].x1-bboxes[b].x0)*(bboxes[b].y1-bboxes[b].y0);
             return aA>bA;
         });
+
 
         for(int ii=1;ii<(int)order.size();++ii){
             int i=order[ii];
@@ -4353,6 +4694,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             }
         }
 
+
         double tBez=vt_now_ms();
         for(auto& pr:paths){
             bool reversed = pr.isHole ? ensureCCW(pr.pts) : ensureCW(pr.pts);
@@ -4362,18 +4704,23 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         }
         timeBezier+=vt_now_ms()-tBez;
 
+
         // ── Stage 11: SVG emit with ENH-9 classified gradients + ENH-10 ──
         double tSVG=vt_now_ms();
+
 
         // ENH-BBOX-FALLBACK (Step 3): track which labels actually produced SVG
         // path data so we can identify which survived-but-untraceable labels
         // need a <rect> fallback at the end of this colour's emission block.
         std::unordered_set<int> emittedLabels;
 
+
         std::string combinedD; combinedD.reserve(paths.size()*64);
+
 
         for(auto& pr : paths){
             bool usedClusterGrad = false;
+
 
             if (!pr.isHole
                 && colorToGrad.find(color) == colorToGrad.end()
@@ -4383,11 +4730,13 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             {
                 int cgId = ++clusterGradCounter;
 
+
                 // ENH-9: classified cluster gradient
                 ClusterGradResult cgr = inferClusterGradClassified(
                     src, labelMap, pr.compLabel,
                     componentBBox[pr.compLabel],
                     width, height, color, kClusterGradDeThresh);
+
 
                 if (cgr.valid) {
                     // Emit multi-stop gradient def
@@ -4413,6 +4762,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                     }
                     allGradDefs += "</linearGradient>";
 
+
                     // Emit primary fill path
                     std::string d = buildPathD(pr, dp, true);
                     if (!d.empty()) {
@@ -4427,6 +4777,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                         ++totalClusterGrads;
                         emittedLabels.insert(pr.compLabel); // ENH-BBOX-FALLBACK
 
+
                         // ENH-10: schedule overlay for Specular and RimLight classes
                         if (cgr.gclass == GradientClass::Specular ||
                             cgr.gclass == GradientClass::RimLight)
@@ -4435,9 +4786,11 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                             float bboxW = (float)(bb[2] - bb[0] + 1);
                             float bboxH = (float)(bb[3] - bb[1] + 1);
 
+
                             std::string contractedD;
                             if (cgr.gclass == GradientClass::RimLight)
                                 contractedD = buildContractedPathD(pr, dp, kRimContractFrac);
+
 
                             uint32_t brightStop = cgr.stopColors[0];
                             for (int si=0; si<cgr.numStops; ++si) {
@@ -4445,6 +4798,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                                 Lab b0 = rgbToLabLUT(brightStop);
                                 if (l.L > b0.L) brightStop = cgr.stopColors[si];
                             }
+
 
                             overlayRecords.push_back({
                                 cgr.gclass,
@@ -4460,6 +4814,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 }
             }
 
+
             if (!usedClusterGrad) {
                 std::string d = buildPathD(pr, dp, true);
                 if (!d.empty()) {
@@ -4470,6 +4825,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 }
             }
         }
+
 
         if (!combinedD.empty()) {
             auto gitIt = colorToGrad.find(color);
@@ -4483,6 +4839,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 paths_svg += "\"/></g>";
             }
         }
+
 
         // ── ENH-BBOX-FALLBACK (Step 4) ────────────────────────────────────
         // For every label that survived the speckle / suppression filters but
@@ -4516,8 +4873,10 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             }
         }
 
+
         timeSVG += vt_now_ms()-tSVG;
     }
+
 
     // Emit ENH-2 gradient paths
     {
@@ -4539,6 +4898,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         timeSVG += vt_now_ms()-tSVG;
     }
 
+
     // ── ENH-10: Emit artistic overlay group ───────────────────────────────
     {
         double tSVG = vt_now_ms();
@@ -4546,9 +4906,11 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         timeSVG += vt_now_ms()-tSVG;
     }
 
+
     // ── Phase 2: Assemble final SVG ───────────────────────────────────────
     std::string svg;
     svg.reserve(allGradDefs.size() + paths_svg.size() + 512);
+
 
     {
         char hdr[384];
@@ -4562,11 +4924,13 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         svg += hdr;
     }
 
+
     if (!allGradDefs.empty()) {
         svg += "<defs>";
         svg += allGradDefs;
         svg += "</defs>";
     }
+
 
     // FIX-MEM-4: Append then immediately release paths_svg to halve peak
     // SVG string memory. Without this, both paths_svg and svg hold the full
@@ -4574,6 +4938,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
     svg += paths_svg;
     { std::string tmp; tmp.swap(paths_svg); } // release paths_svg backing storage
     svg += "</svg>";
+
 
     const double totalMs=vt_now_ms()-t0;
     VT_LOG("vectorize: DONE in %.1f ms | "
@@ -4587,8 +4952,10 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
            timeTrace, timeRDP, timeBezier, timeSVG,
            svg.size());
 
+
     return svg;
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ENH-11 — Multi-Pass Frequency Separation Workflow
@@ -4614,6 +4981,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
 // ═══════════════════════════════════════════════════════════════════════════
  
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helper: apply subject mask to a pixel buffer
 //  Pixels where maskPixels[R] < 128 are set to alpha=0 (transparent).
@@ -4637,6 +5005,7 @@ static std::vector<uint8_t> applyMaskToPixels(
     return out;
 }
 
+
 //inverse mask — keeps background pixels, punches foreground transparent.
 static std::vector<uint8_t> applyInverseMaskToPixels(
     const uint8_t* pixels,
@@ -4656,6 +5025,7 @@ static std::vector<uint8_t> applyInverseMaskToPixels(
 }
  
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helper: run the full single-pass vectorizer with a specific dilation radius.
 //  We temporarily override the global kDilateRadius constant by passing the
@@ -4666,7 +5036,9 @@ static std::vector<uint8_t> applyInverseMaskToPixels(
 //  calling a thin wrapper that clones the pipeline with a custom dilation.
 // ─────────────────────────────────────────────────────────────────────────────
 
+
  
+
 
 // Thin wrapper: vectorize a pre-filtered buffer with overridden dilation.
 // We route through the standard vectorize() pipeline but strip the SVG
@@ -4693,7 +5065,9 @@ static void vectorizeLayerContent(
     // options.blur_radius field (unused for pre-filtered input) as a signal,
     // and add a specialised internal function.
 
+
  
+
 
     // Actually, the cleanest approach given the existing architecture:
     // We call vectorize() and strip the wrapper. The dilation is already
@@ -4703,12 +5077,16 @@ static void vectorizeLayerContent(
     // solution is to use SVG feGaussianBlur on the base group to soften edges:
     // <filter id="base-blur"><feGaussianBlur stdDeviation="0.5"/></filter>
 
+
  
+
 
     (void)ignoreAlphaZero; // handled by caller via mask application
 
+
     // Call the existing pipeline
     std::string fullSvg = vectorize(pixels, W, H, opt);
+
 
     // ── Extract <defs>…</defs> ────────────────────────────────────────────
     {
@@ -4722,11 +5100,13 @@ static void vectorizeLayerContent(
         }
     }
 
+
     // ── Extract inner paths (everything between </defs> or <svg...> and </svg>) ──
     {
         // Find where the inner content starts (after <defs>...</defs> or after <svg ...>)
         const std::string defsClose = "</defs>";
         size_t startPos = std::string::npos;
+
 
         size_t defsEnd = fullSvg.find(defsClose);
         if (defsEnd != std::string::npos) {
@@ -4745,6 +5125,7 @@ static void vectorizeLayerContent(
             outPaths = "";
         }
     }
+
 
     // ── Apply extra dilation via SVG filter if dilateOverride > kDilateRadius ──
     // For the base layer (dilateOverride = 0.75) we add a feGaussianBlur
@@ -4769,6 +5150,7 @@ static void vectorizeLayerContent(
         outPaths = "<g filter=\"url(#vblur-base)\">" + outPaths + "</g>";
     }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pass 4 helper: rasterise edge map into SVG polyline <path> elements.
@@ -4795,10 +5177,12 @@ static std::string buildEdgeLayerSVG(
     const int N = W * H;
     std::vector<bool> isEdge(static_cast<size_t>(N), false);
 
+
     // Build edge mask
     for (int i = 0; i < N; ++i) {
         isEdge[i] = (edgeMapPixels[i * 4] >= edgeMinLum);
     }
+
 
     // FIX-A: Per-run colour-adaptive stroke sampling.
     // The old approach computed one global near-black colour for ALL edge runs,
@@ -4814,6 +5198,7 @@ static std::string buildEdgeLayerSVG(
     // to pure black: navy on sky, charcoal-green on foliage, dark silver on car.
     static constexpr float kEdgeDarkenL   = 30.f;
     static constexpr int   kEdgeNbrRadius = 2;   // 5×5 neighbourhood
+
 
     // Helper: sample neighbourhood, darken L*, return sRGB
     auto sampleRunColor = [&](int midX, int midY) -> uint32_t {
@@ -4851,8 +5236,10 @@ static std::string buildEdgeLayerSVG(
         return packRGB(toS(rl), toS(gl), toS(bl));
     };
 
+
     std::string svg;
     svg.reserve(static_cast<size_t>(N) / 4);
+
 
     // FIX-A+B: No global stroke colour (each path emits its own contextual hue).
     // FIX-B: opacity lowered 0.9 -> 0.55; blend-mode swapped overlay->multiply in Pass 6.
@@ -4865,9 +5252,11 @@ static std::string buildEdgeLayerSVG(
         (double)strokeWidth);
     svg += groupHdr;
 
+
     // Horizontal runs
     std::vector<bool> consumed(static_cast<size_t>(N), false);
     const int kMinRunLen = 3;
+
 
     for (int y = 0; y < H; ++y) {
         int x = 0;
@@ -4879,6 +5268,7 @@ static std::string buildEdgeLayerSVG(
             int runEnd = x; // exclusive
             int runLen = runEnd - runStart;
             if (runLen < kMinRunLen) continue;
+
 
             // FIX-A: emit per-run contextual stroke colour
             {
@@ -4898,6 +5288,7 @@ static std::string buildEdgeLayerSVG(
         }
     }
 
+
     // Vertical runs (for pixels not already consumed)
     for (int x = 0; x < W; ++x) {
         int y = 0;
@@ -4910,6 +5301,7 @@ static std::string buildEdgeLayerSVG(
             int runEnd = y;
             int runLen = runEnd - runStart;
             if (runLen < kMinRunLen) continue;
+
 
             // FIX-A: emit per-run contextual stroke colour
             {
@@ -4929,9 +5321,11 @@ static std::string buildEdgeLayerSVG(
         }
     }
 
+
     svg += "</g>";
     return svg;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: vectorizeLayerContentTileSpeckle
@@ -4957,6 +5351,7 @@ static void vectorizeLayerContentTileSpeckle(
     traceOpt.filter_speckle = 1;
     std::string fullSvg = vectorize(pixels, W, H, traceOpt);
 
+
     // Extract defs and path body from the SVG wrapper
     {
         const std::string defsOpen  = "<defs>";
@@ -4979,16 +5374,19 @@ static void vectorizeLayerContentTileSpeckle(
             outPaths = fullSvg;
     }
 
+
     // If all tiles are detail tiles (filter_speckle == 1) skip post-filter.
     bool anyCoarse = false;
     for (const auto& to : tileOptsGrid)
         if (to.filter_speckle > 1) { anyCoarse = true; break; }
     if (!anyCoarse) return;
 
+
     const int egW = tileGridW;
     const int egH = tileGridH;
     const int tileW = (W + egW - 1) / egW;
     const int tileH = (H + egH - 1) / egH;
+
 
     std::string filtered;
     filtered.reserve(outPaths.size());
@@ -5001,12 +5399,15 @@ static void vectorizeLayerContentTileSpeckle(
         }
         filtered += outPaths.substr(pos, pathStart - pos);
 
+
         size_t pathEnd = outPaths.find("/>", pathStart);
         if (pathEnd == std::string::npos) pathEnd = outPaths.find("</path>", pathStart);
         if (pathEnd == std::string::npos) { filtered += outPaths.substr(pathStart); break; }
         pathEnd += (outPaths[pathEnd] == '/' ? 2 : 7);
 
+
         std::string pathElem = outPaths.substr(pathStart, pathEnd - pathStart);
+
 
         // Extract centroid from first M command in 'd' attribute
         float cx = W * 0.5f, cy = H * 0.5f;
@@ -5030,16 +5431,19 @@ static void vectorizeLayerContentTileSpeckle(
             }
         }
 
+
         int tx = std::clamp((int)(cx / tileW), 0, egW - 1);
         int ty = std::clamp((int)(cy / tileH), 0, egH - 1);
         int ti = ty * egW + tx;
         const TileOptions& to = tileOptsGrid[static_cast<size_t>(ti)];
+
 
         if (to.filter_speckle <= 1) {
             filtered += pathElem;
             pos = pathEnd;
             continue;
         }
+
 
         // Approximate pixel area from bounding box scan of path data
         float minX = cx, maxX = cx, minY = cy, maxY = cy;
@@ -5075,12 +5479,14 @@ static void vectorizeLayerContentTileSpeckle(
         }
         float approxArea = (maxX - minX) * (maxY - minY);
 
+
         if (approxArea < static_cast<float>(to.min_area)) {
             VT_LOG("ENH-16: dropped speckle path (tile %d,%d, area≈%.0f < %d)",
                    tx, ty, (double)approxArea, to.min_area);
             pos = pathEnd;
             continue;
         }
+
 
         // Flat tile: replace path with tile-filling <rect>
         if (to.filter_speckle >= 32) {
@@ -5104,18 +5510,22 @@ static void vectorizeLayerContentTileSpeckle(
             continue;
         }
 
+
         // Mid-tier: keep path
         filtered += pathElem;
         pos = pathEnd;
     }
+
 
     outPaths = std::move(filtered);
     VT_LOG("ENH-16: tile-speckle post-filter done (%zu bytes)",
            outPaths.size());
 }
 
+
 // Forward Declaration
 static void scopeSvgIds(std::string& s, const std::string& prefix);
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: vectorizeLayerContentWithTileOpts
@@ -5134,6 +5544,7 @@ static void vectorizeLayerContentWithTileOpts(
     int   tileGridW, int tileGridH,
     std::string& outDefs,
     std::string& outPaths);   // forward-declared; defined below runPass
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: runPassWithTileOpts
@@ -5161,6 +5572,7 @@ static void runPassWithTileOpts(
 {
     std::string defs, paths;
 
+
     if (tileOptsGrid.empty()) {
         vectorizeLayerContent(pixels, W, H, opt,
                                dilateOverride, ignoreAlpha, defs, paths);
@@ -5172,8 +5584,10 @@ static void runPassWithTileOpts(
             defs, paths);
     }
 
+
     scopeSvgIds(defs,  idPrefix);
     scopeSvgIds(paths, idPrefix);
+
 
     allDefs += defs;
     std::string gOpen;
@@ -5181,15 +5595,25 @@ static void runPassWithTileOpts(
     gOpen += "<g id=\"";
     gOpen += layerId;
     gOpen += "\"";
-    if (groupOpacity > 0.f && groupOpacity < 1.f) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), " opacity=\"%.2f\"", (double)groupOpacity);
-        gOpen += buf;
-    }
-    if (blendMode && blendMode[0]) {
-        gOpen += " style=\"mix-blend-mode:";
-        gOpen += blendMode;
-        gOpen += "\"";
+    // FIX-DARK-7: Combine blend-mode and opacity into a single style attribute
+    // for consistent behaviour on mobile WebView SVG renderers.
+    {
+        std::string styleVal;
+        if (blendMode && blendMode[0]) {
+            styleVal += "mix-blend-mode:";
+            styleVal += blendMode;
+            styleVal += ";";
+        }
+        if (groupOpacity > 0.f && groupOpacity < 1.f) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "opacity:%.2f;", (double)groupOpacity);
+            styleVal += buf;
+        }
+        if (!styleVal.empty()) {
+            gOpen += " style=\"";
+            gOpen += styleVal;
+            gOpen += "\"";
+        }
     }
     if (fillOpacityAttr && fillOpacityAttr[0]) {
         gOpen += " fill-opacity=\"";
@@ -5198,10 +5622,12 @@ static void runPassWithTileOpts(
     }
     gOpen += ">";
 
+
     svgBody += gOpen;
     svgBody += paths;
     svgBody += "</g>\n";
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Internal helper: scope all SVG id="" and url(#) references with a prefix
@@ -5226,6 +5652,7 @@ static void scopeSvgIds(std::string& s, const std::string& prefix)
         }
     }
 } 
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: vectorizeLayerContentWithTileOpts — definition
@@ -5254,6 +5681,7 @@ static void vectorizeLayerContentWithTileOpts(
         outDefs, outPaths);
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Internal helper: run one pass, scope IDs, accumulate defs + body.
 //  blendMode: if non-empty, added as style="mix-blend-mode:..." on the group.
@@ -5278,21 +5706,38 @@ static void runPass(
     scopeSvgIds(defs,  idPrefix);
     scopeSvgIds(paths, idPrefix);
 
+
     allDefs += defs;
-    // Build group opening tag with optional opacity / blend-mode attributes
+    // Build group opening tag with optional opacity / blend-mode attributes.
+    // FIX-DARK-7: Combine opacity and mix-blend-mode into a single style="" attribute.
+    // On mobile WebView (React Native), having opacity="" as an SVG presentation attribute
+    // and mix-blend-mode in style="" can create conflicting stacking contexts, causing
+    // the blended group to be composited at full opacity before the attribute opacity applies.
+    // Putting both in style="" is unambiguous and consistent across all SVG renderers.
     std::string gOpen;
     gOpen.reserve(192);
     gOpen += "<g id=\"";
     gOpen += layerId;
     gOpen += "\"";
-    if (groupOpacity > 0.f && groupOpacity < 1.f) {
-        char buf[32]; snprintf(buf, sizeof(buf), " opacity=\"%.2f\"", (double)groupOpacity);
-        gOpen += buf;
-    }
-    if (blendMode && blendMode[0]) {
-        gOpen += " style=\"mix-blend-mode:";
-        gOpen += blendMode;
-        gOpen += "\"";
+
+    // Build style string combining blend-mode and opacity
+    {
+        std::string styleVal;
+        if (blendMode && blendMode[0]) {
+            styleVal += "mix-blend-mode:";
+            styleVal += blendMode;
+            styleVal += ";";
+        }
+        if (groupOpacity > 0.f && groupOpacity < 1.f) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "opacity:%.2f;", (double)groupOpacity);
+            styleVal += buf;
+        }
+        if (!styleVal.empty()) {
+            gOpen += " style=\"";
+            gOpen += styleVal;
+            gOpen += "\"";
+        }
     }
     if (fillOpacityAttr && fillOpacityAttr[0]) {
         gOpen += " fill-opacity=\"";
@@ -5301,12 +5746,15 @@ static void runPass(
     }
     gOpen += ">";
 
+
  
+
 
     svgBody += gOpen;
     svgBody += paths;
     svgBody += "</g>\n";
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Public entry point: vectorizeMultiPass()  — ENH-12 6-Pass Stochastic
@@ -5343,10 +5791,13 @@ std::string vectorizeMultiPass(
         return "";
     }
 
+
     const double t0 = vt_now_ms();
     VT_LOG("vectorizeMultiPass ENH-12 6-pass: start %dx%d", width, height);
 
+
  
+
 
     // ── Apply sensible defaults ───────────────────────────────────────────
     auto applyDefaults = [](Options& o) {
@@ -5364,6 +5815,7 @@ std::string vectorizeMultiPass(
     applyDefaults(options.pass3);
  
 
+
     std::string allDefs;
     std::string svgBody;
     // PERF-NEW-7: Reserve SVG string buffers upfront to avoid repeated
@@ -5376,6 +5828,7 @@ std::string vectorizeMultiPass(
         svgBody.reserve(bodyEstimate);
         allDefs.reserve(bodyEstimate / 8);
     }
+
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PASS 1 — Base Layer
@@ -5392,7 +5845,9 @@ std::string vectorizeMultiPass(
     // uses a separate per-tile semaphore bounded to hw_concurrency-1, so combined
     // thread count is still capped and thermal throttling is avoided.
 
+
  
+
 
     // PERF-ENH-5: Extract highlight and shadow buffers in a single scan
     std::vector<uint8_t> hlPixels, shadowPixels;
@@ -5402,7 +5857,9 @@ std::string vectorizeMultiPass(
         hlPixels, shadowPixels);
     VT_LOG("vectorizeMultiPass: highlight+shadow extraction done (single-pass ENH-5)");
 
+
  
+
 
     // PERF-NEW-2: Pre-compute bilateral-filtered pixel buffers for all passes
     // that share the same (sigma_s, sigma_r) before dispatching async tasks.
@@ -5418,6 +5875,7 @@ std::string vectorizeMultiPass(
     };
     std::unordered_map<BilateralKey, std::shared_ptr<std::vector<uint8_t>>, BilateralKeyHash>
         bilateralCache;
+
 
     // Pre-filter helper: returns a cached bilaterally-filtered copy of `src`.
     // If blur_radius <= 0, returns nullptr (caller uses src directly).
@@ -5438,6 +5896,7 @@ std::string vectorizeMultiPass(
         return filtered;
     };
 
+
     // Pre-filter for Passes 4 and 5 (both have non-zero blur_radius)
     // Pass 2 has blur_radius=0 (forced below); Pass 1 also 0. Pass 3 is 0.
     {
@@ -5450,6 +5909,7 @@ std::string vectorizeMultiPass(
     }
     VT_LOG("vectorizeMultiPass: bilateral pre-pass done (PERF-NEW-2)");
 
+
     // FIX-MEM-3: The bilateralCache retains large filtered pixel buffers
     // (potentially 2 x W*H*4 bytes) for the entire function lifetime.
     // Pre-filter is done above; clear cache now to free memory before the
@@ -5457,7 +5917,9 @@ std::string vectorizeMultiPass(
     // buffer inside vectorize(), so the cache entries are no longer needed).
     bilateralCache.clear();
 
+
     using PassResult = std::pair<std::string,std::string>;
+
 
   
     // Pass 1 (async) -- independent
@@ -5474,6 +5936,7 @@ std::string vectorizeMultiPass(
                        ? options.baseDilateRadius
                        : kBaseDilateRadiusENH12;
 
+
     std::string d, b;
     runPass(originalPixels, width, height,   // ← was maskedBlur/blurPixels
             p1, baseDilate, false,
@@ -5483,6 +5946,7 @@ std::string vectorizeMultiPass(
     VT_LOG("vectorizeMultiPass: Pass 1 done in %.1f ms", vt_now_ms() - ts);
     return {d, b};
 });
+
 
     // Pass 2 (async) -- produces pass2PixelColor needed by Pass 3
     //
@@ -5510,7 +5974,9 @@ std::string vectorizeMultiPass(
     //     std::vector<uint8_t> maskedOriginal =
     //         applyMaskToPixels(originalPixels, maskPixels, width, height);
 
+
     // AFTER — Pass 2a background (new), Pass 2b foreground (renamed from Pass 2)
+
 
     // Pass 2a (async) -- background LCQ: sky, mountains, road
     auto fut2a = std::async(std::launch::async, [&]() -> PassResult {
@@ -5558,15 +6024,18 @@ std::string vectorizeMultiPass(
         return {d, b};
     });
 
+
     // Pass 2b (async) -- foreground LCQ: car/subject only (was Pass 2)
     std::vector<uint32_t> pass2PixelColor;
     auto fut2 = std::async(std::launch::async, [&]() -> PassResult {
         double ts = vt_now_ms();
 
+
         // Step 1: mask original to foreground only
         std::vector<uint8_t> maskedOriginal =
             applyMaskToPixels(originalPixels, maskPixels, width, height);
  
+
 
         // Step 2: run LCQ -- fills pass2PixelColor with per-pixel palette assignments
         // ENH-16: receive per-tile options for downstream speckle filtering.
@@ -5582,6 +6051,7 @@ std::string vectorizeMultiPass(
                 options.varFlat, options.varMid);  // ENH-16 thresholds
         VT_LOG("ENH-12a LCQ: %d palette entries for Pass 2", (int)p2Palette.size());
  
+
 
         // Step 3: Reconstruct full RGBA image from LCQ per-pixel assignments.
         // Each opaque pixel gets the RGB of its tile's nearest palette color.
@@ -5603,7 +6073,9 @@ std::string vectorizeMultiPass(
         }
         VT_LOG("ENH-12-FIX: Pass 2 LCQ RGBA reconstruction complete (%d px)", N);
 
+
  
+
 
         // Step 4: Configure tracer for maximum LCQ color fidelity.
         // color_precision=8  -> up to 256 palette slots; prevents re-collapse of
@@ -5627,6 +6099,7 @@ std::string vectorizeMultiPass(
             int egW = std::max(1, std::min(kLCQGridW, width  / 64));
             int egH = std::max(1, std::min(kLCQGridH, height / 64));
 
+
             runPassWithTileOpts(
                 lcqReconstructed.data(), width, height,
                 p2, kDilateRadius, true,
@@ -5639,7 +6112,9 @@ std::string vectorizeMultiPass(
         return {d, b};
     });
 
+
  
+
 
     // Pass 4 (async) -- independent
     auto fut4 = std::async(std::launch::async, [&]() -> PassResult {
@@ -5655,16 +6130,21 @@ std::string vectorizeMultiPass(
         p4.fit_tolerance     = 2.f;
         p4.gradient_detect_thresh = 8.f;
         std::string d, b;
+        // FIX-DARK-2: removed redundant fillOpacityAttr="0.3" — it was stacking with
+        // groupOpacity (kPass4Opacity) causing effective alpha of 0.3*0.3=0.09 (invisible).
+        // Now only the group opacity (kPass4Opacity=0.55) applies.
         runPass(hlPixels.data(), width, height,
                 p4, kDilateRadius, true,
                 "layer-highlights", "p4-",
-                kPass4Opacity, "screen", "0.3",
+                kPass4Opacity, "screen", nullptr,
                 d, b);
         VT_LOG("vectorizeMultiPass: Pass 4 done in %.1f ms", vt_now_ms() - ts);
         return {d, b};
     });
 
+
  
+
 
     // Pass 5 (async) -- independent
     auto fut5 = std::async(std::launch::async, [&]() -> PassResult {
@@ -5680,15 +6160,20 @@ std::string vectorizeMultiPass(
         p5.fit_tolerance     = 1.f;
         p5.gradient_detect_thresh = 10.f;
         std::string d, b;
+        // FIX-DARK-3: Changed blend-mode from "multiply" to nullptr (normal).
+        // Shadow pixels are already the darkest areas; multiply further darkened them
+        // and compounded with the Pass 6 multiply edge layer → pure black output.
+        // At kPass5Opacity=0.45 with normal blend, shadows provide depth without crushing.
         runPass(shadowPixels.data(), width, height,
                 p5, 1.5f, true,
                 "layer-lowlights", "p5-",
-                kPass5Opacity, "multiply", nullptr,
+                kPass5Opacity, nullptr, nullptr,
                 d, b);
         VT_LOG("vectorizeMultiPass: Pass 5 done in %.1f ms", vt_now_ms() - ts);
         return {d, b};
     });
  
+
 
     // FIX-MEM-2: Ensure all outstanding futures are joined before any local
     // variable goes out of scope. If fut2.get() (or Pass 3) throws, the
@@ -5709,11 +6194,13 @@ std::string vectorizeMultiPass(
     // } joiner{{&fut1, &fut4, &fut5}};
     } joiner{{&fut1, &fut2a, &fut2, &fut4, &fut5}};
 
+
     // Wait for Pass 2, then run Pass 3 (depends on pass2PixelColor)
     {
         auto [d2, b2] = fut2.get();
         // Insert Pass 2 into the SVG (will be followed by Pass 3)
         allDefs += d2; svgBody += b2;
+
 
         double ts3 = vt_now_ms();
         std::vector<uint8_t> adaptedHP =
@@ -5729,16 +6216,20 @@ std::string vectorizeMultiPass(
         p3.blur_radius      = 0.f;
         p3.bilateral_sigma_r = 5.f;
         std::string d3, b3;
+        // FIX-DARK-4: Changed Pass 3 blend-mode from "soft-light" to nullptr (normal).
+        // soft-light on dark base layers was desaturating and darkening micro-detail colors.
+        // Normal blend at kPass3Opacity=0.75 preserves the actual micro-detail hues.
         runPass(adaptedHP.data(), width, height,
                 p3, 0.f, false,
                 "layer-microdetail", "p3-",
-                options.highPassGroupOpacity > 0.f ? options.highPassGroupOpacity : kPass3Opacity, 
-                "soft-light", nullptr,
+                options.highPassGroupOpacity > 0.f ? options.highPassGroupOpacity : kPass3Opacity,
+                nullptr, nullptr,
                 d3, b3);
         VT_LOG("vectorizeMultiPass: Pass 3 done in %.1f ms", vt_now_ms() - ts3);
         allDefs += d3; svgBody += b3;
     }
  
+
 
     // Collect async results in SVG layer-stack order.
     // FIX-MEM-2c: Mark joiner done BEFORE calling get() so the destructor
@@ -5752,6 +6243,7 @@ std::string vectorizeMultiPass(
     // }
     // { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
     // { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
+
 
     //layer order bottom→top: Pass1, Pass2a(bg), Pass2b(fg)+Pass3, Pass4, Pass5
     {
@@ -5769,8 +6261,10 @@ std::string vectorizeMultiPass(
     { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
     { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
 
+
     VT_LOG("vectorizeMultiPass: Passes 1-5 complete (parallel ENH-10)");
  
+
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PASS 6 — Edge / Ink Layer  (ENH-12 spec: stroke not fill)
@@ -5783,6 +6277,7 @@ std::string vectorizeMultiPass(
         double ts = vt_now_ms();
  
 
+
         // Build the edge SVG using existing buildEdgeLayerSVG, then wrap in
         // a blend-mode group for the multiply composite effect.
         std::string edgeSVG = buildEdgeLayerSVG(
@@ -5793,13 +6288,17 @@ std::string vectorizeMultiPass(
             options.pass1.path_precision);
  
 
-        // FIX-B: swap overlay -> multiply so dark strokes on dark layers
-        // never compound to pure black (multiply(dst,src) preserves hue).
+
+        // FIX-DARK-5: Changed edge layer blend-mode from "multiply" to "overlay".
+        // multiply(dark, dark) = pure black, crushing all color in the shadow areas.
+        // overlay preserves hue while adding structural definition on both light and dark regions.
+        // The old comment "FIX-B: swap overlay -> multiply" was itself the regression —
+        // this reverts that misguided change.
         {
             size_t idPos = edgeSVG.find("id=\"layer-edges\"");
             if (idPos != std::string::npos)
                 edgeSVG.replace(idPos, 16,
-                    "id=\"layer-edges\" style=\"mix-blend-mode:multiply\"");
+                    "id=\"layer-edges\" style=\"mix-blend-mode:overlay\"");
         }
         allDefs += ""; // no defs for edge layer
         svgBody += edgeSVG;
@@ -5808,6 +6307,7 @@ std::string vectorizeMultiPass(
         VT_LOG("vectorizeMultiPass: Pass 6 done in %.1f ms", vt_now_ms() - ts);
     }
  
+
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Assemble final SVG
@@ -5834,12 +6334,26 @@ std::string vectorizeMultiPass(
     }
  
 
+
     if (!allDefs.empty()) {
         svg += "<defs>";
         svg += allDefs;
         svg += "</defs>";
     }
- 
+
+    // FIX-DARK-6: Insert a solid white background rect before all layers.
+    // Without this, mix-blend-mode:multiply and mix-blend-mode:overlay composite
+    // against transparent black (RGBA 0,0,0,0) — turning every semi-transparent
+    // dark area into pure black. A white base rect ensures all blend modes behave
+    // as specified (multiply(white, color) = color; screen(black, color) = color).
+    {
+        char bgRect[128];
+        snprintf(bgRect, sizeof(bgRect),
+            "<rect width=\"%d\" height=\"%d\" fill=\"white\"/>",
+            width, height);
+        svg += bgRect;
+    }
+
     svg += svgBody;
     svg += "</svg>";
  
@@ -5849,5 +6363,6 @@ std::string vectorizeMultiPass(
     return svg;
 }
  
+
 
 } // namespace vtracer
