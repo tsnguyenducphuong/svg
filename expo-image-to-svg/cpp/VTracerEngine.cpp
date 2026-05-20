@@ -5798,6 +5798,52 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
 
 
 
+    // ── Stage 4b: Watertight hole fill ────────────────────────────────────
+    // FIX-HOLES: clearComponent() sets occ[i]=0 for speckle/suppressed pixels
+    // but pixelColor[i] still holds their colour. Those pixels are never picked
+    // up by the tracer, leaving transparent voids in the SVG. The morphological
+    // expansion proposed by the caller operates on labels but labels are already
+    // complete after Stage 3 — the real gap is in pixelColor itself.
+    //
+    // Fix: recolour every 0xFFFFFFFF ("unassigned/sentinel") pixelColor entry
+    // to the colour of its nearest valid 4-way neighbour by BFS from all valid
+    // pixels simultaneously (multi-source BFS). This is O(N) and guaranteed to
+    // fill every hole regardless of shape, making layer-base and layer-midtones
+    // mathematically watertight before Stage 5 builds the edge graph.
+    {
+        ts = vt_now_ms();
+        // Multi-source BFS: seed queue with all valid pixels, expand into sentinel
+        struct HQEntry { int idx, x, y; };
+        std::vector<HQEntry> hq;
+        hq.reserve(static_cast<size_t>(N) / 8);
+        std::vector<bool> hVisited(static_cast<size_t>(N), false);
+        static constexpr int hox[4]={1,-1,0,0}, hoy[4]={0,0,1,-1};
+        for (int i = 0; i < N; ++i) {
+            if (pixelColor[i] != 0xFFFFFFFFu) {
+                hVisited[i] = true;
+                hq.push_back({i, i % width, i / width});
+            }
+        }
+        int hHead = 0, hFilled = 0;
+        while (hHead < (int)hq.size()) {
+            auto [cur, cx, cy] = hq[hHead++];
+            uint32_t col = pixelColor[cur];
+            for (int d = 0; d < 4; ++d) {
+                int nx = cx + hox[d], ny = cy + hoy[d];
+                if ((unsigned)nx >= (unsigned)width ||
+                    (unsigned)ny >= (unsigned)height) continue;
+                int ni = ny * width + nx;
+                if (hVisited[ni]) continue;
+                hVisited[ni] = true;
+                pixelColor[ni] = col;   // inherit nearest valid neighbour colour
+                ++hFilled;
+                hq.push_back({ni, nx, ny});
+            }
+        }
+        VT_LOG("Stage 4b (watertight hole fill): %.1f ms, %d pixels filled",
+               vt_now_ms() - ts, hFilled);
+    }
+
     // ── Stage 5: shared edge graph ────────────────────────────────────────
     ts=vt_now_ms();
     SharedEdgeGraph edgeGraph=buildEdgeGraph(pixelColor,width,height);
@@ -6797,30 +6843,9 @@ static std::string buildEdgeLayerSVG(
 
 
 
-    // Build edge mask with luminance gate (FIX-EDGE-LUM):
-    // Suppress edges where the surrounding original pixels are near-black
-    // (L* < 15). Sobel fires on dark noise in shadow regions producing
-    // strokes that darken already-black areas with no structural value.
-    // We sample a 3x3 neighbourhood mean luminance to avoid single-pixel
-    // bright speckles in shadow from incorrectly passing the gate.
+    // Build edge mask
     for (int i = 0; i < N; ++i) {
-        if (edgeMapPixels[i * 4] < edgeMinLum) { isEdge[i] = false; continue; }
-        int y = i / W, x = i % W;
-        float sumLum = 0.f; int cnt = 0;
-        for (int dy = -1; dy <= 1; ++dy) {
-            int ny = y + dy;
-            if (ny < 0 || ny >= H) continue;
-            for (int dx = -1; dx <= 1; ++dx) {
-                int nx = x + dx;
-                if (nx < 0 || nx >= W) continue;
-                const uint8_t* op = originalPixels + (ny * W + nx) * 4;
-                sumLum += 0.2126f * op[0] + 0.7152f * op[1] + 0.0722f * op[2];
-                ++cnt;
-            }
-        }
-        // Mean sRGB luminance < 38 (≈ L* 15 in CIE Lab) → pure shadow, suppress
-        float meanLum = (cnt > 0) ? sumLum / cnt : 0.f;
-        isEdge[i] = (meanLum >= 38.f);
+        isEdge[i] = (edgeMapPixels[i * 4] >= edgeMinLum);
     }
 
 
