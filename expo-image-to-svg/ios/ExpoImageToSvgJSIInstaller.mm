@@ -464,6 +464,12 @@ jsi::Value vectorizeMultiPassJSI(
    mpOpts.shadowLStar =
        getOptFloat(rt, params, "shadowLStar",    mpOpts.shadowLStar);
 
+   mpOpts.varFlat =
+       getOptFloat(rt, params, "varFlat",    mpOpts.varFlat);
+
+   mpOpts.varMid =
+       getOptFloat(rt, params, "varMid",    mpOpts.varMid);
+
 
    // ── Per-pass options ──────────────────────────────────────────────────────
    // Each pass sub-object is merged over the C++ struct defaults, so only the

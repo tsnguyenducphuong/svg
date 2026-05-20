@@ -497,6 +497,9 @@ export interface VectorizeMultiPassOptions {
    * @default 28.0  (~darkest 15% of luminance)
    */
   shadowLStar?: number;
+
+  varFlat?: number;
+  varMid?:    number;
 }
 
 
@@ -552,6 +555,9 @@ export const MULTI_PASS_DEFAULTS = {
   // ── ENH-12c: Highlight / Shadow thresholds ─────────────────────────────
   highlightLStar:         85.0,  // top ~10% brightness → screen blend
   shadowLStar:            28.0,  // darkest ~15% → multiply blend
+
+  varFlat:                20.0,
+  varMid:                 150.0,
 
   // ── Per-pass defaults ───────────────────────────────────────────────────
 

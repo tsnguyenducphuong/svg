@@ -10840,9 +10840,12 @@ std::string vectorizeMultiPass(
         std::vector<TileOptions> bgTileOpts;
         buildLCQPaletteAndAssign(
             maskedBackground.data(), width, height,
-            kLCQGridW, kLCQGridH, kLCQColorsPerTile,
+            options.lcqGridW  > 0 ? options.lcqGridW  : kLCQGridW,
+            options.lcqGridH  > 0 ? options.lcqGridH  : kLCQGridH,
+            kLCQColorsPerTile,
             bgPixelColor, bgTileOpts,
-            options.varFlat, options.varMid);
+            options.varFlat > 0.f ? options.varFlat : kVarFlat,
+            options.varMid  > 0.f ? options.varMid  : kVarMid);
         const int N = width * height;
         std::vector<uint8_t> bgReconstructed(static_cast<size_t>(N) * 4, 0);
         for (int i = 0; i < N; ++i) {
@@ -10857,23 +10860,22 @@ std::string vectorizeMultiPass(
             dst[3] = srcAlpha;
         }
         Options p2a = options.pass2;
-        p2a.color_precision  = 8;   // full 256-slot palette for sky/mountain color richness
+        p2a.color_precision  = 8;
         p2a.corner_threshold = 30.f;
         p2a.filter_speckle   = 1;
         p2a.path_precision   = 2;
         p2a.rdp_epsilon      = 0.8f;
         p2a.blur_radius      = 0.f;
-        // Use options-driven LCQ grid (same as Pass 2b) for consistent tile size
-        int egW = std::max(1, std::min(
-            options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW, width  / 64));
-        int egH = std::max(1, std::min(
-            options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH, height / 64));
+        int lcqW2a = options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW;
+        int lcqH2a = options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH;
+        int egW = std::max(1, std::min(lcqW2a, width  / 64));
+        int egH = std::max(1, std::min(lcqH2a, height / 64));
         std::string d, b;
         runPassWithTileOpts(
             bgReconstructed.data(), width, height,
             p2a, kDilateRadius, true,
             "layer-background", "p2a-",
-            -1.f,           // FIX: full opacity — background must not bleed over foreground
+            -1.f,           // full opacity — background must not bleed over foreground
             nullptr, nullptr,
             bgTileOpts, egW, egH,
             d, b);
@@ -10911,7 +10913,8 @@ std::string vectorizeMultiPass(
                 kLCQColorsPerTile,
                 pass2PixelColor,
                 p2TileOpts,
-                options.varFlat, options.varMid);  // ENH-16 thresholds
+                options.varFlat > 0.f ? options.varFlat : kVarFlat,  // ENH-16 thresholds
+                options.varMid  > 0.f ? options.varMid  : kVarMid);
         VT_LOG("ENH-12a LCQ: %d palette entries for Pass 2", (int)p2Palette.size());
  
 
@@ -10965,8 +10968,10 @@ std::string vectorizeMultiPass(
         // thresholds and detail tiles preserve micro-paths.
         {
             // Compute effective grid dimensions matching buildLocalColorQuantization.
-            int egW = std::max(1, std::min(kLCQGridW, width  / 64));
-            int egH = std::max(1, std::min(kLCQGridH, height / 64));
+            int lcqW2b = options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW;
+            int lcqH2b = options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH;
+            int egW = std::max(1, std::min(lcqW2b, width  / 64));
+            int egH = std::max(1, std::min(lcqH2b, height / 64));
 
 
 
@@ -11152,31 +11157,18 @@ std::string vectorizeMultiPass(
 
 
 
-    // Layer order bottom→top: Pass1 → Pass2a(bg) → Pass2b+3(fg+detail) → Pass4 → Pass5
-    // FIX-ZORDER: Pass2b+3 were already appended (allDefs+=d2, svgBody+=b2 above).
-    // We now prepend Pass2a above Pass1, and Pass1 as the absolute bottom.
-    // This ensures: coarse fills (P1) → background LCQ (P2a) → foreground+detail (P2b+P3)
-    // → highlights (P4) → shadows (P5). Pass2a at full opacity only covers bg pixels
-    // (alpha=0 where car is) so it never bleeds over the foreground.
+    //layer order bottom→top: Pass1, Pass2a(bg), Pass2b(fg)+Pass3, Pass4, Pass5
     {
-        // Pass 2a: background LCQ (sky, mountains, road) — sits above Pass 1
+        // Pass 2a background sits above Pass 1 but below the foreground
         auto [d2a, b2a] = fut2a.get();
-        // Prepend ABOVE Pass1 but BELOW the already-appended Pass2b+3
-        // Build correct order: P1 + P2a + (existing svgBody containing P2b+P3)
-        std::string existingBody = svgBody;
-        std::string existingDefs = allDefs;
-        allDefs.clear(); svgBody.clear();
-
+        allDefs = d2a + allDefs;
+        svgBody = b2a + svgBody;
+    }
+    {
+        // Pass 1 is the bottom-most layer
         auto [d1, b1] = fut1.get();
-        // Bottom layer first
-        allDefs  = d1;
-        svgBody  = b1;
-        // Background LCQ above base
-        allDefs += d2a;
-        svgBody += b2a;
-        // Foreground + detail (Pass2b + Pass3) already assembled
-        allDefs += existingDefs;
-        svgBody += existingBody;
+        allDefs = d1 + allDefs;
+        svgBody = b1 + svgBody;
     }
     { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
     { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
