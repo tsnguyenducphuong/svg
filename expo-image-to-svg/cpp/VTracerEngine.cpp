@@ -354,6 +354,7 @@
 #include <string>
 #include <thread>             // PERF-NEW-1: std::thread::hardware_concurrency
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ── Logging ──────────────────────────────────────────────────────────────────
