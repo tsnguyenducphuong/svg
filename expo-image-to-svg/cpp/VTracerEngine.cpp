@@ -337,6 +337,7 @@
 // ENH-11: Multi-Pass Frequency Separation (see vectorizeMultiPass below)
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <climits>
@@ -3484,19 +3485,42 @@ static void emitOverlays(
 {
     if (overlays.empty() && W == 0) return;
     // ── (c) Global AO vignette def ─────────────────────────────────────────
-    // A full-canvas radial gradient, dark at corners, transparent at centre
+    // A full-canvas radial gradient, dark at corners, transparent at centre.
+    //
+    // FIX-TRIANGLE-1: The original used gradientUnits="objectBoundingBox" with
+    // r="70%". In objectBoundingBox space the gradient ellipse is scaled to the
+    // bounding box of the filled rect (W x H). For non-square images the circle
+    // becomes an ellipse whose minor-axis radius is 70% of the shorter dimension.
+    // Any corner beyond that radius is clamped to the last stop (solid black at
+    // kAOVignetteOpacity) via SVG's default spreadMethod="pad", producing a hard
+    // black triangle in the far corners.
+    //
+    // Fix: switch to gradientUnits="userSpaceOnUse" and set r to the actual
+    // half-diagonal of the canvas (sqrt((W/2)²+(H/2)²)), so the gradient circle
+    // exactly reaches every corner with a smooth fade — no hard clip, no triangle.
+    // The final stop is placed at offset=1.0 (the corner) so the darkening
+    // transitions smoothly all the way to the edge rather than clamping.
     int aoGradId = ++gradCounter;
     {
-        char aoDef[512];
+        float cxF = W * 0.5f;
+        float cyF = H * 0.5f;
+        // Half-diagonal: guarantees the circle edge touches all four corners exactly.
+        float rF  = std::sqrt(cxF * cxF + cyF * cyF);
+        // Inner clear zone: 55% of the half-diagonal stays fully transparent.
+        float innerStop = 0.55f;
+        char aoDef[600];
         snprintf(aoDef, sizeof(aoDef),
             "<radialGradient id=\"vao%d\" "
-            "cx=\"50%%\" cy=\"50%%\" r=\"70%%\" "
-            "gradientUnits=\"objectBoundingBox\">"
+            "cx=\"%.1f\" cy=\"%.1f\" r=\"%.1f\" "
+            "gradientUnits=\"userSpaceOnUse\">"
             "<stop offset=\"0\" stop-color=\"#000\" stop-opacity=\"0\"/>"
-            "<stop offset=\"0.7\" stop-color=\"#000\" stop-opacity=\"0\"/>"
+            "<stop offset=\"%.2f\" stop-color=\"#000\" stop-opacity=\"0\"/>"
             "<stop offset=\"1\" stop-color=\"#000\" stop-opacity=\"%.2f\"/>"
             "</radialGradient>",
-            aoGradId, (double)kAOVignetteOpacity);
+            aoGradId,
+            (double)cxF, (double)cyF, (double)rF,
+            (double)innerStop,
+            (double)kAOVignetteOpacity);
         allGradDefs += aoDef;
     }
     // ── Per-component overlay defs ─────────────────────────────────────────
@@ -3552,7 +3576,13 @@ static void emitOverlays(
         }
     }
     // ── Overlay path elements ──────────────────────────────────────────────
-    svg += "<g pointer-events=\"none\">";
+    // FIX-TRIANGLE-3: Add isolation:isolate to the overlay group so that
+    // mix-blend-mode on child elements composites within the group's own
+    // offscreen buffer rather than blending directly against the white
+    // background rect (FIX-DARK-6). Without isolation, the AO vignette
+    // multiply rect blended against pure white → pure black in all corners,
+    // reinforcing the triangle artifact in combination with FIX-TRIANGLE-1.
+    svg += "<g pointer-events=\"none\" style=\"isolation:isolate\">";
     // (a) Specular overlays
     for (size_t i=0; i<overlays.size(); ++i) {
         auto& ov = overlays[i];
@@ -3583,13 +3613,18 @@ static void emitOverlays(
         svg += ov.contractedD;
         svg += "\"/>";
     }
-    // (c) Global AO vignette — full-canvas rect with multiply blend
+    // (c) Global AO vignette — full-canvas rect with normal blend.
+    // FIX-TRIANGLE-3b: Changed from mix-blend-mode:multiply to normal.
+    // The gradient's stop-opacity already encodes the desired darkening amount.
+    // multiply(semi-black, underlying) was compounding the darkness and, combined
+    // with the objectBoundingBox corner-clipping bug (FIX-TRIANGLE-1), produced
+    // a solid black triangle. With normal blend the vignette is just a translucent
+    // dark overlay — clean and predictable on all SVG renderers.
     {
         char aoPath[256];
         snprintf(aoPath, sizeof(aoPath),
             "<rect x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" "
-            "fill=\"url(#vao%d)\" "
-            "style=\"mix-blend-mode:multiply\"/>",
+            "fill=\"url(#vao%d)\"/>",
             W, H, aoGradId);
         svg += aoPath;
     }
@@ -4378,26 +4413,39 @@ static void vectorizeLayerContent(
         }
     }
     // ── Apply extra dilation via SVG filter if dilateOverride > kDilateRadius ──
-    // For the base layer (dilateOverride = 0.75) we add a feGaussianBlur
-    // of stdDeviation=(dilateOverride - 0.5) on the group, which achieves the
-    // "soft expansion" effect that fills sub-pixel gaps.
+    // FIX-TRIANGLE-2: The filter id "vblur-base" and its url(#vblur-base) reference
+    // were injected into outDefs/outPaths *before* scopeSvgIds() runs in runPass().
+    // scopeSvgIds prefixes ALL id="" and url(#) it finds, so:
+    //   - id="vblur-base"    → id="p1-vblur-base"   (correct)
+    //   - url(#vblur-base)   → url(#p1-vblur-base)  (correct)
+    // BUT if dilateOverride is large on multiple passes or the filter tag string
+    // "id=\"" appears elsewhere in outDefs, scopeSvgIds can double-prefix or
+    // mis-prefix, breaking the reference. The group then renders without the
+    // Gaussian clip, bleeds beyond the SVG viewport, and is clipped to a triangle
+    // by the renderer's viewport scissor.
+    //
+    // Fix: embed a unique per-call token directly in the filter id at injection
+    // time (using a static counter), so it is already globally unique before
+    // scopeSvgIds sees it. scopeSvgIds will still prefix it, but the prefix is
+    // applied consistently to both id= and url(#) since they share the same token.
     if (dilateOverride > kDilateRadius + 0.05f) {
+        static std::atomic<int> vblurCounter{0};
+        int vblurId = ++vblurCounter;
         float blurSd = dilateOverride - kDilateRadius;
-        char filterTag[256];
-        snprintf(filterTag, sizeof(filterTag),
-            " filter=\"url(#vblur-base)\"");
-        // Inject a filter def entry into outDefs
+        // Build a unique filter id that won't collide across concurrent passes.
+        char filterId[64];
+        snprintf(filterId, sizeof(filterId), "vblur%d", vblurId);
         char filterDef[256];
         snprintf(filterDef, sizeof(filterDef),
-            "<filter id=\"vblur-base\" x=\"-2%%\" y=\"-2%%\" "
+            "<filter id=\"%s\" x=\"-2%%\" y=\"-2%%\" "
             "width=\"104%%\" height=\"104%%\">"
             "<feGaussianBlur stdDeviation=\"%.2f\"/>"
             "</filter>",
-            (double)blurSd);
+            filterId, (double)blurSd);
         outDefs = std::string(filterDef) + outDefs;
-        // We can't easily inject filter= into each path, so we wrap the
-        // entire outPaths in a group with the filter applied.
-        outPaths = "<g filter=\"url(#vblur-base)\">" + outPaths + "</g>";
+        char filterRef[128];
+        snprintf(filterRef, sizeof(filterRef), "<g filter=\"url(#%s)\">", filterId);
+        outPaths = std::string(filterRef) + outPaths + "</g>";
     }
 }
 // ─────────────────────────────────────────────────────────────────────────────
