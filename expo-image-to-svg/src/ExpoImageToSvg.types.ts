@@ -500,6 +500,7 @@ export interface VectorizeMultiPassOptions {
 
   varFlat?: number;
   varMid?:    number;
+  colorMode?: ColorMode;
 }
 
 
@@ -540,6 +541,7 @@ export const MULTI_PASS_DEFAULTS = {
   edgeStrokeWidth:        0.5,   // Pass 6 ink stroke width
   edgeMinLuminance:       140,    // Pass 6 minimum edge R-channel
   highPassGroupOpacity:   0.75,   // legacy compat
+  colorMode:              'color' as ColorMode,
 
   // ── ENH-12a: Local Color Quantization ──────────────────────────────────
   lcqGridW:               24,    // 16×16 tile grid to 24x24 grid

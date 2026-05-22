@@ -4283,6 +4283,7 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
     return svg;
 }
 
+static void scopeSvgIds(std::string& s, const std::string& prefix);
 // ═════════════════════════════════════════════════════════════════════════════
 //  ENH-17 — Direct Palette Injection (DPI)
 //
@@ -4534,6 +4535,7 @@ static std::string vectorizeWithPreassignedColors(
             if (pixelColor[i] == color) { occ[i] = 1; occDirty.push_back(i); }
         std::vector<PathRecord> paths;
         std::unordered_set<int> survivedLabels;
+        // Stage 1: trace all boundary contours for this colour (no segs yet)
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 int idx = y * width + x;
@@ -4548,7 +4550,7 @@ static std::string vectorizeWithPreassignedColors(
                     bool doSuppress = false;
                     if (lbl < (int)componentBBox.size()) {
                         // ENH-17: always use relaxed suppression — DPI produces
-                        // tile-local fine regions that strict suppression would erase.
+                        // fine tile-local regions that strict suppression would erase.
                         doSuppress = shouldSuppressComponentDetail(
                             lbl, color, componentSize[lbl],
                             labelMap, pixelColor,
@@ -4566,24 +4568,62 @@ static std::string vectorizeWithPreassignedColors(
                 if (raw.size() < 3) continue;
                 std::vector<Point> simplified = rdpSimplify(raw, options.rdp_epsilon);
                 if (simplified.size() < 3) continue;
-                std::vector<uint8_t> corners = detectCorners(simplified, options.corner_threshold);
-                std::vector<Segment> segs = buildSplineLSQ(simplified, corners, raw, options.fit_tolerance);
-                if (segs.empty()) continue;
-                paths.push_back({std::move(raw), std::move(simplified), std::move(segs), false, lbl});
-                // Holes
-                std::vector<std::array<int,4>> holeSeeds;
-                findHoles(x, y, occ, width, height, labelMap, lbl, holeSeeds);
-                for (auto& hs : holeSeeds) {
-                    std::vector<Point> hr = traceBoundary(hs[0], hs[1], width, height, occ, compMaxSteps);
-                    if (hr.size() < 3) continue;
-                    std::vector<Point> hs2 = rdpSimplify(hr, options.rdp_epsilon);
-                    if (hs2.size() < 3) continue;
-                    std::vector<uint8_t> hcorners = detectCorners(hs2, options.corner_threshold);
-                    std::vector<Segment> hsegs = buildSplineLSQ(hs2, hcorners, hr, options.fit_tolerance);
-                    if (hsegs.empty()) continue;
-                    paths.push_back({std::move(hr), std::move(hs2), std::move(hsegs), true, -1});
+                // segs left empty — built in Stage 2 after hole detection
+                paths.push_back({std::move(raw), std::move(simplified), {}, false, lbl});
+            }
+        }
+        // Stage 2: hole detection via bbox containment + point-in-polygon,
+        // then winding-order normalisation, then spline fitting.
+        // Mirrors the identical logic in vectorize() (Stage 10).
+        {
+            struct BBox { float x0,y0,x1,y1; };
+            auto getBBox = [](const std::vector<Point>& p) noexcept -> BBox {
+                BBox bb{1e30f,1e30f,-1e30f,-1e30f};
+                for (auto& v:p){
+                    bb.x0=std::min(bb.x0,v.x); bb.y0=std::min(bb.y0,v.y);
+                    bb.x1=std::max(bb.x1,v.x); bb.y1=std::max(bb.y1,v.y);
+                }
+                return bb;
+            };
+            auto bbContains = [](const BBox& o, const BBox& i) noexcept -> bool {
+                return i.x0>=o.x0 && i.y0>=o.y0 && i.x1<=o.x1 && i.y1<=o.y1;
+            };
+            std::vector<BBox> bboxes;
+            bboxes.reserve(paths.size());
+            for (auto& pr : paths) bboxes.push_back(getBBox(pr.pts));
+            std::vector<int> order((int)paths.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](int a, int b){
+                float aA=(bboxes[a].x1-bboxes[a].x0)*(bboxes[a].y1-bboxes[a].y0);
+                float bA=(bboxes[b].x1-bboxes[b].x0)*(bboxes[b].y1-bboxes[b].y0);
+                return aA > bA;
+            });
+            for (int ii = 1; ii < (int)order.size(); ++ii) {
+                int i = order[ii];
+                for (int jj = 0; jj < ii; ++jj) {
+                    int j = order[jj];
+                    if (!bbContains(bboxes[j], bboxes[i])) continue;
+                    float cx=0, cy=0;
+                    int np=(int)paths[i].pts.size();
+                    for (auto& p : paths[i].pts){ cx+=p.x; cy+=p.y; }
+                    if (np > 0){ cx/=np; cy/=np; }
+                    if (pointInPolygon(paths[j].pts, cx, cy)){
+                        paths[i].isHole = true; break;
+                    }
                 }
             }
+            // Winding-order normalisation + spline fitting (one pass)
+            for (auto& pr : paths) {
+                bool reversed = pr.isHole ? ensureCCW(pr.pts) : ensureCW(pr.pts);
+                if (reversed) std::reverse(pr.rawPts.begin(), pr.rawPts.end());
+                auto corners = detectCorners(pr.pts, options.corner_threshold);
+                pr.segs = buildSplineLSQ(pr.pts, corners, pr.rawPts, options.fit_tolerance);
+            }
+            // Drop paths where spline fitting produced no segments
+            paths.erase(
+                std::remove_if(paths.begin(), paths.end(),
+                    [](const PathRecord& pr){ return pr.segs.empty(); }),
+                paths.end());
         }
         // SVG emit
         std::unordered_set<int> emittedLabels;
@@ -5327,7 +5367,6 @@ static void vectorizeLayerContentTileSpeckle(
            outPaths.size());
 }
 // Forward Declaration
-static void scopeSvgIds(std::string& s, const std::string& prefix);
 // ─────────────────────────────────────────────────────────────────────────────
 //  ENH-16: vectorizeLayerContentWithTileOpts
 //
