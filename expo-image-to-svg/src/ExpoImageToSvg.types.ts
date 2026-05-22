@@ -507,7 +507,7 @@ export interface VectorizeMultiPassOptions {
 //  Default values — single-pass entry point.
 // ---------------------------------------------------------------------------
 export const VECTORIZE_DEFAULTS = {
-  precision:            6,
+  precision:            8,
   gradientStep:         0,
   colorMode:            'color' as ColorMode,
   filterSpeckle:        4,
@@ -536,10 +536,10 @@ export const VECTORIZE_DEFAULTS = {
 // ---------------------------------------------------------------------------
 export const MULTI_PASS_DEFAULTS = {
   // ── Composite controls ──────────────────────────────────────────────────
-  baseDilateRadius:       2.0,   // ENH-12d: 2 px seals all base-layer seams
+  baseDilateRadius:       0.8,   // ENH-12d: 2 px seals all base-layer seams
   edgeStrokeWidth:        0.5,   // Pass 6 ink stroke width
-  edgeMinLuminance:       80,    // Pass 6 minimum edge R-channel
-  highPassGroupOpacity:   0.6,   // legacy compat
+  edgeMinLuminance:       140,    // Pass 6 minimum edge R-channel
+  highPassGroupOpacity:   0.75,   // legacy compat
 
   // ── ENH-12a: Local Color Quantization ──────────────────────────────────
   lcqGridW:               24,    // 16×16 tile grid to 24x24 grid
@@ -550,7 +550,7 @@ export const MULTI_PASS_DEFAULTS = {
   seamRepairThresh:        2.5,
 
   // ── ENH-12b: Adaptive Threshold ────────────────────────────────────────
-  microDetailDeltaEThresh: 2.0,  // ΔE gate for micro-detail pass: down from 6.0 to 2.0
+  microDetailDeltaEThresh: 4.0,  // ΔE gate for micro-detail pass: down from 6.0 to 2.0
 
   // ── ENH-12c: Highlight / Shadow thresholds ─────────────────────────────
   highlightLStar:         85.0,  // top ~10% brightness → screen blend
@@ -563,7 +563,7 @@ export const MULTI_PASS_DEFAULTS = {
 
   // Pass 1: solid painterly undercoat from the pre-blurred image.
   pass1: {
-    precision:            3,     // 8 colours — smooth broad fills
+    precision:            6,     // 8 colours — smooth broad fills
     threshold:            60,    // smooth curves
     filterSpeckle:        6,
     rdpEpsilon:           2.5,
@@ -578,7 +578,7 @@ export const MULTI_PASS_DEFAULTS = {
     precision:            8,     // LCQ handles true quantization
     threshold:            30,    // ENH-12 spec: sharp 30° corners
     filterSpeckle:        1,     // min_area = 1 (keep every region)
-    pathPrecision:        4,     // high path precision
+    pathPrecision:        2,     // high path precision
     rdpEpsilon:           0.25,   //0.8 down to 0.25
     fitTolerance:         0.5,
     gradientDetectThresh: 4.0,
@@ -591,7 +591,7 @@ export const MULTI_PASS_DEFAULTS = {
     threshold:            15,    // very sharp — micro-detail is angular
     filterSpeckle:        1,     // min_area = 1 — keep every grain
     pathPrecision:        1,
-    rdpEpsilon:           0.2,   // minimal simplification
+    rdpEpsilon:           0.3,   // minimal simplification
     fitTolerance:         0.5,
     blurRadius:           0,     // NO smoothing (ENH-12 spec)
     bilateralSigmaR:      5.0,   // tight range filter
