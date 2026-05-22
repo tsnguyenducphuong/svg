@@ -1427,22 +1427,90 @@ static void stitchAdjacentTilePalettes(
                              ? cntA[i] : kStitchMinCount;
                     int wB = (j < (int)cntB.size() && cntB[j] >= kStitchMinCount)
                              ? cntB[j] : kStitchMinCount;
+                    // long total = (long)wA + (long)wB;
+                    // double rL = ((double)wA * L.linearise[rCh(tpA.colors[i])]
+                    //            + (double)wB * L.linearise[rCh(tpB.colors[j])]) / total;
+                    // double gLin = ((double)wA * L.linearise[gCh(tpA.colors[i])]
+                    //              + (double)wB * L.linearise[gCh(tpB.colors[j])]) / total;
+                    // double bL = ((double)wA * L.linearise[bCh(tpA.colors[i])]
+                    //            + (double)wB * L.linearise[bCh(tpB.colors[j])]) / total;
+                    // auto toSRGB = [&](double v) -> uint8_t {
+                    //     int ix = (int)(std::clamp(v, 0.0, 1.0) * 4095.0 + 0.5);
+                    //     return srgbLUT[ix];
+                    // };
+                    // uint32_t anchor = packRGB(toSRGB(rL), toSRGB(gLin), toSRGB(bL));
+
+                    //(ENH-20) ────────────────────────────────────────────────────────────
                     long total = (long)wA + (long)wB;
-                    double rL = ((double)wA * L.linearise[rCh(tpA.colors[i])]
-                               + (double)wB * L.linearise[rCh(tpB.colors[j])]) / total;
-                    double gLin = ((double)wA * L.linearise[gCh(tpA.colors[i])]
-                                 + (double)wB * L.linearise[gCh(tpB.colors[j])]) / total;
-                    double bL = ((double)wA * L.linearise[bCh(tpA.colors[i])]
-                               + (double)wB * L.linearise[bCh(tpB.colors[j])]) / total;
-                    auto toSRGB = [&](double v) -> uint8_t {
-                        int ix = (int)(std::clamp(v, 0.0, 1.0) * 4095.0 + 0.5);
-                        return srgbLUT[ix];
-                    };
-                    uint32_t anchor = packRGB(toSRGB(rL), toSRGB(gLin), toSRGB(bL));
-                    tpA.colors[i] = anchor;
-                    tpB.colors[j] = anchor;
-                    // Update labA for subsequent j comparisons against the new anchor
-                    labA = rgbToLabLUT(anchor);
+
+                    // ENH-20: Compute the stitch anchor in Lab space with a
+                    // chroma-weighted circular mean for the hue angle.
+                    //
+                    // Linear-RGB averaging correctly blends luminance but
+                    // pulls the hue angle toward achromatic when one color
+                    // has high chroma and the other is near-grey (C* ≈ 0).
+                    // The same fix already applied in kMeansPlusPlusRefine
+                    // (FIX-HUE) is applied here:
+                    //
+                    //   L*_anchor = weighted mean of L*_A and L*_B
+                    //   C*_anchor = weighted mean of C*_A and C*_B
+                    //   h_anchor  = atan2( wA·C*A·sin(hA) + wB·C*B·sin(hB),
+                    //                      wA·C*A·cos(hA) + wB·C*B·cos(hB) )
+                    //
+                    // Near-achromatic colors contribute near-zero weight to
+                    // the hue direction, so a saturated blue + grey average
+                    // stays blue rather than rotating toward achromatic.
+                    {
+                        Lab labA = rgbToLabLUT(tpA.colors[i]);
+                        Lab labB = rgbToLabLUT(tpB.colors[j]);
+
+                        // Weighted L* (perceptually linear, direct mean is fine)
+                        float anchorL = (float)(
+                            ((double)wA * labA.L + (double)wB * labB.L) / total);
+
+                        // Chroma magnitudes
+                        float cA = std::sqrt(labA.a * labA.a + labA.b * labA.b);
+                        float cB = std::sqrt(labB.a * labB.a + labB.b * labB.b);
+
+                        // Weighted C* (linear average of magnitudes)
+                        float anchorC = (float)(
+                            ((double)wA * cA + (double)wB * cB) / total);
+
+                        // Chroma-weighted circular mean hue
+                        // Each color's unit hue vector (a*/C*, b*/C*) is
+                        // weighted by w × C* so near-grey inputs contribute
+                        // near-zero hue pull regardless of their w.
+                        double hueAccA = (double)wA * cA * labA.a   // == wA·C*A·cos(hA)
+                                       + (double)wB * cB * labB.a;  // == wB·C*B·cos(hA)
+                        double hueAccB = (double)wA * cA * labA.b
+                                       + (double)wB * cB * labB.b;
+                        double hueLen  = std::sqrt(hueAccA*hueAccA + hueAccB*hueAccB);
+
+                        float anchorA, anchorB;
+                        if (hueLen > 1e-9 && anchorC > kChromaBoostMinC) {
+                            // Reconstruct a*, b* at the blended magnitude
+                            // along the chroma-weighted hue direction
+                            anchorA = (float)(anchorC * hueAccA / hueLen);
+                            anchorB = (float)(anchorC * hueAccB / hueLen);
+                        } else {
+                            // Both colors are near-achromatic: simple Lab average
+                            anchorA = (float)(
+                                ((double)wA * labA.a + (double)wB * labB.a) / total);
+                            anchorB = (float)(
+                                ((double)wA * labA.b + (double)wB * labB.b) / total);
+                        }
+
+                        uint32_t anchor = labToRGB({anchorL, anchorA, anchorB});
+                        tpA.colors[i] = anchor;
+                        tpB.colors[j] = anchor;
+                        // Update labA so subsequent j-loop iterations compare
+                        // against the corrected anchor, not the original centroid.
+                        labA = rgbToLabLUT(anchor);
+                    }
+                    // tpA.colors[i] = anchor;
+                    // tpB.colors[j] = anchor;
+                    // // Update labA for subsequent j comparisons against the new anchor
+                    // labA = rgbToLabLUT(anchor);
                 }
             }
         }
@@ -5572,6 +5640,160 @@ static void runPass(
     svgBody += paths;
     svgBody += "</g>\n";
 }
+
+// ENH-18: Chromatic High-Pass Reconstruction
+// Instead of tracing the raw highPassPixels (Original - Blur in uint8,
+// near-zero RGB), reconstruct a *colorized* HP buffer:
+//   For each pixel i:
+//     1. Compute Lab(original[i]) and Lab(blur[i])
+//     2. ΔL = L_orig - L_blur,  Δa = a_orig - a_blur,  Δb = b_orig - b_blur
+//     3. Base color = pass2PixelColor[i]  (the LCQ surface color)
+//     4. Apply deltas: Lab_out = {base.L + ΔL, base.a + Δa, base.b + Δb}
+//     5. Convert back to sRGB → chromaticHP[i]
+//     6. Zero out pixel if ciede2000(Lab_orig, Lab_blur) < kMicroDetailDeltaEThresh
+//        (same suppression gate as before, but measured on original residual)
+//
+// Result: Pass 3 now carries REAL surface hues shifted by the high-frequency
+// luminance and chroma detail — not near-zero residuals. K-means on this
+// buffer produces a palette of actual image colors, not near-grey.
+static std::vector<uint8_t> buildChromaticHighPass(
+    const uint8_t* originalPixels,
+    const uint8_t* blurPixels,
+    const std::vector<uint32_t>& pass2PixelColor,
+    int W, int H,
+    float deltaEThresh)
+{
+    const int N = W * H;
+    std::vector<uint8_t> out(static_cast<size_t>(N) * 4, 0);
+
+    for (int i = 0; i < N; ++i) {
+        const uint8_t* o = originalPixels + i * 4;
+        const uint8_t* b = blurPixels     + i * 4;
+        if (o[3] == 0) continue;                    // transparent: skip
+
+        uint32_t origRGB = packRGB(o[0], o[1], o[2]);
+        uint32_t blurRGB = packRGB(b[0], b[1], b[2]);
+
+        Lab labOrig = rgbToLabLUT(origRGB);
+        Lab labBlur = rgbToLabLUT(blurRGB);
+
+        // Suppress low-frequency or identical pixels
+        float de = ciede2000(labOrig, labBlur);
+        if (de < deltaEThresh) continue;             // zero → transparent
+
+        // High-pass deltas in Lab space
+        float dL = labOrig.L - labBlur.L;
+        float da = labOrig.a - labBlur.a;
+        float db = labOrig.b - labBlur.b;
+
+        // Base color = the LCQ surface color assigned to this pixel
+        uint32_t base = pass2PixelColor[i];
+        if (base == 0xFFFFFFFFu) base = origRGB;    // unassigned fallback
+
+        Lab labBase = rgbToLabLUT(base);
+
+        // Apply HP delta to the real surface color
+        Lab labOut = {
+            std::clamp(labBase.L + dL, 0.f, 100.f),
+            std::clamp(labBase.a + da, -128.f, 127.f),
+            std::clamp(labBase.b + db, -128.f, 127.f)
+        };
+
+        uint32_t outRGB = labToRGB(labOut);         // uses linearToSRGBLUT
+
+        uint8_t* dst = out.data() + static_cast<size_t>(i) * 4;
+        dst[0] = rCh(outRGB);
+        dst[1] = gCh(outRGB);
+        dst[2] = bCh(outRGB);
+        dst[3] = o[3];
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENH-19: buildColoredLuminanceSplit
+//
+// Replaces the raw hlPixels / shadowPixels buffer fed to runPass().
+// Instead of extracting the raw pixel RGB (which K-means then collapses
+// to near-white or near-black), this function:
+//
+//   1. Selects pixels by the same L* threshold as before.
+//   2. For each selected pixel, substitutes the LCQ surface color
+//      (pass2PixelColor[i]) as the base hue, then shifts its L* by the
+//      delta between the original pixel's L* and the LCQ color's L*.
+//      This preserves the exact luminance structure that makes the
+//      highlight/shadow extraction meaningful while anchoring the hue
+//      to the real surface color (not the near-white/near-black extreme).
+//   3. Runs LCQ (buildLCQPaletteAndAssign) on this hue-anchored buffer
+//      so the tile-local palette sees full chroma variation.
+//   4. Returns the LCQ pixelColor map and palette for DPI injection,
+//      bypassing vectorize()'s internal global K-means entirely.
+//
+// Result: Pass 4 (screen) now composites warm yellows over car metal,
+// cool blues over sky highlights, and skin pinks over portraits —
+// rather than a uniform near-white wash. Pass 5 (shadows) gains deep
+// blues, warm browns, and cool greys instead of flat near-black.
+// ─────────────────────────────────────────────────────────────────────────
+static std::vector<uint8_t> buildColoredLuminanceSplit(
+    const uint8_t*               originalPixels,
+    const std::vector<uint32_t>& pass2PixelColor,   // LCQ surface colors
+    int W, int H,
+    float lStarThresh,
+    bool  keepAbove,   // true = highlights (L* >= thresh), false = shadows
+    std::vector<uint32_t>& outPixelColor,            // LCQ assignments for DPI
+    std::vector<uint32_t>& outPalette)               // LCQ palette for DPI
+{
+    const int N = W * H;
+    std::vector<uint8_t> anchoredBuf(static_cast<size_t>(N) * 4, 0);
+
+    for (int i = 0; i < N; ++i) {
+        const uint8_t* o = originalPixels + i * 4;
+        if (o[3] == 0) continue;
+
+        uint32_t origRGB = packRGB(o[0], o[1], o[2]);
+        Lab labOrig = rgbToLabLUT(origRGB);
+
+        // Apply the same luminance gate
+        bool isSelected = keepAbove ? (labOrig.L >= lStarThresh)
+                                    : (labOrig.L <= lStarThresh);
+        if (!isSelected) continue;
+
+        // Get the LCQ surface color for this pixel
+        uint32_t baseRGB = pass2PixelColor[i];
+        if (baseRGB == 0xFFFFFFFFu) baseRGB = origRGB; // unassigned fallback
+
+        Lab labBase = rgbToLabLUT(baseRGB);
+
+        // Shift the base color's L* to match the original's luminance
+        // but keep a*/b* from the real surface (full hue preserved).
+        // This means a bright yellow pixel gets written as:
+        //   L* = original highlight L* (~88)
+        //   a*/b* = LCQ yellow surface a*/b* (~−5, +50)
+        // instead of near-white (L*~88, a*~0, b*~3).
+        Lab labOut = {
+            labOrig.L,                              // original luminance
+            labBase.a,                              // surface hue
+            labBase.b
+        };
+        uint32_t outRGB = labToRGB(labOut);
+
+        uint8_t* dst = anchoredBuf.data() + static_cast<size_t>(i) * 4;
+        dst[0] = rCh(outRGB);
+        dst[1] = gCh(outRGB);
+        dst[2] = bCh(outRGB);
+        dst[3] = o[3];
+    }
+
+    // Run LCQ on the hue-anchored buffer — same grid as Pass 2
+    std::vector<TileOptions> tileOpts;
+    outPalette = buildLCQPaletteAndAssign(
+        anchoredBuf.data(), W, H,
+        kLCQGridW, kLCQGridH, kLCQColorsPerTile,
+        outPixelColor, tileOpts,
+        kVarFlat, kVarMid);
+
+    return anchoredBuf;
+}
 // ─────────────────────────────────────────────────────────────────────────────
 //  Public entry point: vectorizeMultiPass()  — ENH-12 6-Pass Stochastic
 //  Painterly Rendering Pipeline
@@ -5947,40 +6169,77 @@ std::string vectorizeMultiPass(
         // FIX-DARK-2: removed redundant fillOpacityAttr="0.3" — it was stacking with
         // groupOpacity (kPass4Opacity) causing effective alpha of 0.3*0.3=0.09 (invisible).
         // Now only the group opacity (kPass4Opacity=0.55) applies.
-        runPass(hlPixels.data(), width, height,
-                p4, kDilateRadius, true,
-                "layer-highlights", "p4-",
-                kPass4Opacity, "screen", nullptr,
-                d, b);
+        // runPass(hlPixels.data(), width, height,
+        //         p4, kDilateRadius, true,
+        //         "layer-highlights", "p4-",
+        //         kPass4Opacity, "screen", nullptr,
+        //         d, b);
+
+        //(Pass 4, ENH-19):
+        {
+            std::vector<uint32_t> hlPixelColor, hlPalette;
+            std::vector<uint8_t> anchoredHL = buildColoredLuminanceSplit(
+                originalPixels, pass2PixelColor,
+                width, height,
+                kHighlightLStarThresh, /*keepAbove=*/true,
+                hlPixelColor, hlPalette);
+
+            std::string dpiDefs, dpiPaths;
+            vectorizeLayerContentDPI(
+                originalPixels,         // for ENH-14 dominant-color resample
+                anchoredHL.data(),      // hue-anchored highlight buffer for tracing
+                width, height,
+                p4, kDilateRadius,
+                hlPalette, hlPixelColor,
+                dpiDefs, dpiPaths);
+
+            scopeSvgIds(dpiDefs,  "p4-");
+            scopeSvgIds(dpiPaths, "p4-");
+            char gOpen[128];
+            snprintf(gOpen, sizeof(gOpen),
+                "<g id=\"layer-highlights\" style=\"mix-blend-mode:screen;opacity:%.2f\">",
+                (double)kPass4Opacity);
+            d = dpiDefs;
+            b = std::string(gOpen) + dpiPaths + "</g>";
+        }
+
         VT_LOG("vectorizeMultiPass: Pass 4 done in %.1f ms", vt_now_ms() - ts);
         return {d, b};
     });
 
     // Pass 5 (async) -- independent
-    auto fut5 = std::async(std::launch::async, [&]() -> PassResult {
-        double ts = vt_now_ms();
-        Options p5;
-        p5.color_precision   = 3;
-        p5.corner_threshold  = 80.f;
-        p5.filter_speckle    = 8;
-        p5.path_precision    = 1;
-        p5.rdp_epsilon       = 2.f;
-        p5.blur_radius       = 1.5f;
-        p5.bilateral_sigma_r = 40.f;
-        p5.fit_tolerance     = 1.f;
-        p5.gradient_detect_thresh = 10.f;
-        std::string d, b;
-        // FIX-DARK-3: Changed blend-mode from "multiply" to nullptr (normal).
-        // Shadow pixels are already the darkest areas; multiply further darkened them
-        // and compounded with the Pass 6 multiply edge layer → pure black output.
-        // At kPass5Opacity=0.45 with normal blend, shadows provide depth without crushing.
-        runPass(shadowPixels.data(), width, height,
-                p5, 1.5f, true,
-                "layer-lowlights", "p5-",
-                kPass5Opacity, nullptr, nullptr,
-                d, b);
-        VT_LOG("vectorizeMultiPass: Pass 5 done in %.1f ms", vt_now_ms() - ts);
-        return {d, b};
+    // auto fut5 = std::async(std::launch::async, [&]() -> PassResult {
+    //     double ts = vt_now_ms();
+    //     Options p5;
+    //     p5.color_precision   = 3;
+    //     p5.corner_threshold  = 80.f;
+    //     p5.filter_speckle    = 8;
+    //     p5.path_precision    = 1;
+    //     p5.rdp_epsilon       = 2.f;
+    //     p5.blur_radius       = 1.5f;
+    //     p5.bilateral_sigma_r = 40.f;
+    //     p5.fit_tolerance     = 1.f;
+    //     p5.gradient_detect_thresh = 10.f;
+    //     std::string d, b;
+    //     // FIX-DARK-3: Changed blend-mode from "multiply" to nullptr (normal).
+    //     // Shadow pixels are already the darkest areas; multiply further darkened them
+    //     // and compounded with the Pass 6 multiply edge layer → pure black output.
+    //     // At kPass5Opacity=0.45 with normal blend, shadows provide depth without crushing.
+    //     runPass(shadowPixels.data(), width, height,
+    //             p5, 1.5f, true,
+    //             "layer-lowlights", "p5-",
+    //             kPass5Opacity, nullptr, nullptr,
+    //             d, b);
+    //     VT_LOG("vectorizeMultiPass: Pass 5 done in %.1f ms", vt_now_ms() - ts);
+    //     return {d, b};
+    // });
+
+    // ENH-19: Pass 5 is now run sequentially after fut2.get() so it can consume
+    // pass2PixelColor (written inside fut2's lambda) without a data race.
+    // This stub keeps fut5 alive for the FutureJoiner and the fut5.get() at the
+    // result-collection site; the real work is in the fut2.get() block below.
+    auto fut5 = std::async(std::launch::deferred, []() -> PassResult {
+        return {"", ""};
     });
 
     // FIX-MEM-2: Ensure all outstanding futures are joined before any local
@@ -6007,10 +6266,22 @@ std::string vectorizeMultiPass(
         // Insert Pass 2 into the SVG (will be followed by Pass 3)
         allDefs += d2; svgBody += b2;
         double ts3 = vt_now_ms();
+        // std::vector<uint8_t> adaptedHP =
+        //     adaptiveThresholdHighPass(
+        //         highPassPixels, pass2PixelColor,
+        //         width, height, options.microDetailDeltaEThresh > 0.f ? options.microDetailDeltaEThresh : kMicroDetailDeltaEThresh);
+        
+        //(ENH-18):
         std::vector<uint8_t> adaptedHP =
-            adaptiveThresholdHighPass(
-                highPassPixels, pass2PixelColor,
-                width, height, options.microDetailDeltaEThresh > 0.f ? options.microDetailDeltaEThresh : kMicroDetailDeltaEThresh);
+            buildChromaticHighPass(
+                originalPixels,      // source of truth
+                blurPixels,          // bilateral-filtered (already available)
+                pass2PixelColor,     // LCQ surface assignments from Pass 2b
+                width, height,
+                options.microDetailDeltaEThresh > 0.f
+                    ? options.microDetailDeltaEThresh
+                    : kMicroDetailDeltaEThresh);
+
         Options p3 = options.pass3;
         p3.color_precision  = 7;
         p3.corner_threshold = 15.f;
@@ -6030,7 +6301,119 @@ std::string vectorizeMultiPass(
                 nullptr, nullptr,
                 d3, b3);
         VT_LOG("vectorizeMultiPass: Pass 3 done in %.1f ms", vt_now_ms() - ts3);
-        allDefs += d3; svgBody += b3;
+        allDefs += d3; svgBody += b3; 
+
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  PASS 5 — Low-Light / Shadow Layer  (ENH-19 DPI)
+        //
+        //  ENH-19: Pass 5 moved here (after fut2.get()) so pass2PixelColor is
+        //  available. The old runPass(shadowPixels) fed a near-black sRGB buffer
+        //  into global K-means (color_precision=3 → 8 slots), which collapsed all
+        //  shadow hue into near-black fills. The 8-slot palette on L*≤28 pixels
+        //  cannot distinguish a warm brown shadow from a cool blue shadow.
+        //
+        //  Fix: build a hue-anchored shadow buffer where each selected pixel's
+        //  RGB is replaced with its LCQ surface colour (from pass2PixelColor)
+        //  shifted to the original pixel's L*. K-means now sees the real shadow
+        //  hues (deep blue sky, warm terracotta wall, cool grey road) and the
+        //  resulting paths carry those hues into the SVG instead of near-black.
+        // ═══════════════════════════════════════════════════════════════════
+        {
+            double ts5 = vt_now_ms();
+
+            // ── Step 1: Build hue-anchored shadow buffer ─────────────────
+            // For each shadow pixel (original L* ≤ kShadowLStarThresh):
+            //   output RGB = labToRGB({ orig.L, surface.a*, surface.b* })
+            // where surface = pass2PixelColor[i] (the LCQ foreground color).
+            // Pixels with no LCQ assignment (unassigned sentinel or transparent)
+            // fall back to the raw original pixel so nothing goes blank.
+            const int N5 = width * height;
+            std::vector<uint8_t> shadowAnchoredBuf(static_cast<size_t>(N5) * 4, 0);
+            for (int i = 0; i < N5; ++i) {
+                const uint8_t* o = originalPixels + i * 4;
+                if (o[3] == 0) continue;
+
+                uint32_t origRGB = packRGB(o[0], o[1], o[2]);
+                Lab labOrig = rgbToLabLUT(origRGB);
+                if (labOrig.L > kShadowLStarThresh) continue;   // not a shadow pixel
+
+                uint32_t baseRGB = (i < (int)pass2PixelColor.size() &&
+                                    pass2PixelColor[i] != 0xFFFFFFFFu)
+                                   ? pass2PixelColor[i]
+                                   : origRGB;                    // fallback: raw pixel
+
+                Lab labBase = rgbToLabLUT(baseRGB);
+
+                // Anchor: keep the shadow luminance, take hue from the LCQ surface.
+                Lab labOut = {
+                    labOrig.L,      // preserves the shadow's actual darkness
+                    labBase.a,      // real surface hue (a* channel)
+                    labBase.b       // real surface hue (b* channel)
+                };
+                uint32_t outRGB = labToRGB(labOut);
+
+                uint8_t* dst = shadowAnchoredBuf.data() + static_cast<size_t>(i) * 4;
+                dst[0] = rCh(outRGB);
+                dst[1] = gCh(outRGB);
+                dst[2] = bCh(outRGB);
+                dst[3] = o[3];
+            }
+            VT_LOG("ENH-19: shadow hue-anchor buffer built (%d px)", N5);
+
+            // ── Step 2: LCQ on hue-anchored buffer ───────────────────────
+            // Using the standard grid so tile sizes match Pass 2. Shadow pixels
+            // occupy ~15% of tiles; LCQ naturally skips empty tiles.
+            std::vector<uint32_t> sh5PixelColor, sh5Palette;
+            {
+                std::vector<TileOptions> sh5TileOpts;
+                sh5Palette = buildLCQPaletteAndAssign(
+                    shadowAnchoredBuf.data(), width, height,
+                    kLCQGridW, kLCQGridH, kLCQColorsPerTile,
+                    sh5PixelColor, sh5TileOpts,
+                    options.varFlat, options.varMid);
+            }
+            VT_LOG("ENH-19: Pass 5 LCQ done: %d shadow palette entries",
+                   (int)sh5Palette.size());
+
+            // ── Step 3: DPI — skip global K-means, go straight to components ─
+            Options p5;
+            p5.color_precision        = 8;   // irrelevant (DPI bypasses K-means)
+            p5.corner_threshold       = 80.f;
+            p5.filter_speckle         = 8;
+            p5.path_precision         = 1;
+            p5.rdp_epsilon            = 2.f;
+            p5.blur_radius            = 0.f;  // no bilateral on anchored buf
+            p5.bilateral_sigma_r      = 40.f;
+            p5.fit_tolerance          = 1.f;
+            p5.gradient_detect_thresh = 10.f;
+
+            std::string dpiDefs5, dpiPaths5;
+            vectorizeLayerContentDPI(
+                originalPixels,              // ENH-14: dominant-color resample source
+                shadowAnchoredBuf.data(),    // hue-anchored buffer for boundary tracing
+                width, height,
+                p5, 1.5f,                    // same dilation as old runPass call
+                sh5Palette,
+                sh5PixelColor,               // consumed (moved) inside DPI
+                dpiDefs5, dpiPaths5);
+
+            scopeSvgIds(dpiDefs5,  "p5-");
+            scopeSvgIds(dpiPaths5, "p5-");
+
+            // FIX-DARK-3 preserved: normal blend (no mix-blend-mode), opacity 0.45.
+            char gOpen5[128];
+            snprintf(gOpen5, sizeof(gOpen5),
+                "<g id=\"layer-lowlights\" style=\"opacity:%.2f\">",
+                (double)kPass5Opacity);
+
+            allDefs += dpiDefs5;
+            svgBody += std::string(gOpen5) + dpiPaths5 + "</g>\n";
+
+            VT_LOG("ENH-19: Pass 5 DPI done in %.1f ms", vt_now_ms() - ts5);
+        }
+
+
     }
 
     // Collect async results in SVG layer-stack order.
@@ -6058,8 +6441,13 @@ std::string vectorizeMultiPass(
         allDefs = d1 + allDefs;
         svgBody = b1 + svgBody;
     }
+    // { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
+    // { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
+
     { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
-    { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
+    fut5.get(); // ENH-19: Pass 5 result already written into allDefs/svgBody above.
+
+
     VT_LOG("vectorizeMultiPass: Passes 1-5 complete (parallel ENH-10)");
 
     // ═══════════════════════════════════════════════════════════════════════
