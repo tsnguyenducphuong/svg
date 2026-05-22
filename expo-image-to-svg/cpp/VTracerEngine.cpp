@@ -340,6 +340,19 @@
 //               Skin tone warmth:      +2-3 DeltaE (cool grey regression fixed)
 //               Cost: +1-3 ms on 1080p ARM (O(N) Pass 3 scan). Negligible.
 //
+//  -- FIX-BLEND-1,2 : Pass 2a/2b PassResult d/b Convention Bug ---------------
+//             vectorizeMultiPass() assembles SVG through a PassResult convention
+//             where first=gradient_defs, second=path_body.  Consumer:
+//               allDefs += first;  svgBody += second;
+//             Pass 2a and Pass 2b DPI wrappers had these SWAPPED:
+//               b = dpiDefs; d = paths_group  →  return {paths, defs}
+//             causing the consumer to place path data inside <defs> (never rendered)
+//             and gradient defs inline in the body (inert). Both LCQ passes
+//             (the entire true-color foreground and background) were silently
+//             invisible. Only the coarse Pass 1 base layer rendered, producing
+//             flat desaturated output despite ENH-13/14/21 running correctly.
+//             Fix: d = dpiDefs; b = paths_group in both Pass 2a and Pass 2b.
+//
 // ===========================================================================
 // ==============================================================================
 //  BUG FIXES (2025) -- Memory management + Color quality
@@ -6535,8 +6548,13 @@ std::string vectorizeMultiPass(
             snprintf(gOpen, sizeof(gOpen),
                 "<g id=\"layer-background\" style=\"opacity:%.2f\">",
                 (double)kPass2Opacity);
-            b = dpiDefs;
-            d = std::string(gOpen) + dpiPaths + "</g>";
+            // FIX-BLEND-1: d=defs, b=body is the PassResult convention used by runPass
+            // and consumed at the assembly site (allDefs+=first, svgBody+=second).
+            // Previous code had these swapped: defs went to svgBody (invisible inline
+            // defs), paths went to allDefs (invalid gradient-definition context).
+            // Result was Pass 2a (background LCQ) rendering as completely invisible.
+            d = dpiDefs;
+            b = std::string(gOpen) + dpiPaths + "</g>";
         }
         VT_LOG("vectorizeMultiPass: Pass 2a DPI done in %.1f ms", vt_now_ms() - ts);
         return {d, b};
@@ -6627,8 +6645,13 @@ std::string vectorizeMultiPass(
             snprintf(gOpen, sizeof(gOpen),
                 "<g id=\"layer-midtones\" style=\"opacity:%.2f\">",
                 (double)kPass2Opacity);
-            b = dpiDefs;
-            d = std::string(gOpen) + dpiPaths + "</g>";
+            // FIX-BLEND-2: same d=defs / b=body convention fix as Pass 2a.
+            // Previous swap caused Pass 2b (foreground LCQ) to also render invisible,
+            // leaving only the coarse Pass 1 base layer visible in the output SVG.
+            // This was the primary cause of flat/desaturated true-color output in
+            // vectorizeMultiPass: both LCQ passes were silently discarded.
+            d = dpiDefs;
+            b = std::string(gOpen) + dpiPaths + "</g>";
         }
         VT_LOG("vectorizeMultiPass: Pass 2 DPI done in %.1f ms", vt_now_ms() - ts);
         return {d, b};
