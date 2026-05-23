@@ -530,11 +530,17 @@ private:
 // Local Color Quantization grid dimensions for Pass 2 (Mid-Tones)
 // FIX-COLOR-1: Grid is now adaptive (see buildLocalColorQuantization).
 // These are the maximum values; small images use fewer tiles.
-static constexpr int   kLCQGridW               = 24;   // max 16x16 tile grid
-static constexpr int   kLCQGridH               = 24;
+// ENH-21-FIX: LCQ grid reduced 24×24→12×12, colours/tile 32→12.
+// 24×24×32 = 18 432 palette entries produced tens of thousands of micro-paths
+// (circuit-board glitch in output). 12×12×12 = 1 728 max entries gives broad,
+// well-defined colour regions that compose cleanly across layers.
+static constexpr int   kLCQGridW               = 12;
+static constexpr int   kLCQGridH               = 12;
 // FIX-COLOR-2: Raised from 24 -> 32 to preserve more local palette richness.
 // 24 was the "midpoint" of 16-32 but caused premature color collapse on complex scenes.
-static constexpr int   kLCQColorsPerTile       = 32;   // 32 per tile (was 24)
+// ENH-21-FIX: colours/tile 32→12. Fewer colours per tile forces K-means to
+// produce broad, visually coherent region fills rather than micro-fragments.
+static constexpr int   kLCQColorsPerTile       = 12;
 // Adaptive Threshold for Pass 3 (Micro-Detail) -- DeltaE below this -> suppress
 // FIX-GREY-G: Raised kMicroDetailDeltaEThresh 2.0->4.0.
 // adaptiveThresholdHighPass only passes pixels whose highPass colour
@@ -6437,10 +6443,10 @@ std::string vectorizeMultiPass(
     // mountain taupe, road grey, car body colour) so gap-fill is colour-correct.
     p1.color_precision  = 6;
     p1.corner_threshold = 60.f;
-    p1.filter_speckle   = 6;
-    p1.rdp_epsilon      = 2.5f;
-    p1.blur_radius      = 2.0f;
-    p1.bilateral_sigma_r = 30.f;
+    p1.filter_speckle   = 64;   // ENH-21-FIX: was 6 — suppress all tiny base fragments
+    p1.rdp_epsilon      = 4.0f; // ENH-21-FIX: was 2.5 — broad smooth fills only
+    p1.blur_radius      = 3.0f; // ENH-21-FIX: heavier pre-blur for smooth base shapes
+    p1.bilateral_sigma_r = 40.f;
     // FIX-GREY-A2: Reduce dilation from kBaseDilateRadiusENH12 (2.0px) to 0.8px.
     // At 2.0px each path expands 2 pixels outward, merging adjacent colour regions
     // into large blobs -- a sky-grey blob can swallow the car's body colour region.
@@ -6510,10 +6516,10 @@ std::string vectorizeMultiPass(
         }
         Options p2a = options.pass2;
         p2a.color_precision  = 8;
-        p2a.corner_threshold = 30.f;
-        p2a.filter_speckle   = 1;
+        p2a.corner_threshold = 45.f;  // ENH-21-FIX: smoother background curves
+        p2a.filter_speckle   = 16;    // ENH-21-FIX: suppress small background fragments
         p2a.path_precision   = 2;
-        p2a.rdp_epsilon      = 0.8f;
+        p2a.rdp_epsilon      = 1.5f;  // ENH-21-FIX: more aggressive path simplification
         p2a.blur_radius      = 0.f;
         p2a.gradient_detect_thresh = (options.pass2.gradient_detect_thresh > 0.f)
             ? options.pass2.gradient_detect_thresh : 4.0f;
@@ -6616,10 +6622,10 @@ std::string vectorizeMultiPass(
         //           Every path fill is a real measured pixel colour.
         Options p2 = options.pass2;
         p2.color_precision  = 8;
-        p2.corner_threshold = 30.f;
-        p2.filter_speckle   = 1;
+        p2.corner_threshold = 35.f;   // ENH-21-FIX: slightly smoother foreground
+        p2.filter_speckle   = 8;      // ENH-21-FIX: suppress fragments <8px
         p2.path_precision   = 2;
-        p2.rdp_epsilon      = 0.25f;
+        p2.rdp_epsilon      = 0.8f;   // ENH-21-FIX: was 0.25 — reduce path vertex count
         p2.blur_radius      = 0.f;
         p2.gradient_detect_thresh = (options.pass2.gradient_detect_thresh > 0.f)
             ? options.pass2.gradient_detect_thresh : 4.0f;
@@ -6709,10 +6715,13 @@ std::string vectorizeMultiPass(
 
             scopeSvgIds(dpiDefs,  "p4-");
             scopeSvgIds(dpiPaths, "p4-");
+            // ENH-21-FIX: screen blend on a white background = pure white.
+            // screen(white, x) = white for all x -- bleaches every highlight path.
+            // Use soft-light at lower opacity: preserves luminance without bleaching.
+            // soft-light on light areas brightens moderately; on dark areas darkens.
             char gOpen[128];
             snprintf(gOpen, sizeof(gOpen),
-                "<g id=\"layer-highlights\" style=\"mix-blend-mode:screen;opacity:%.2f\">",
-                (double)kPass4Opacity);
+                "<g id=\"layer-highlights\" style=\"mix-blend-mode:soft-light;opacity:0.38\">");
             d = dpiDefs;
             b = std::string(gOpen) + dpiPaths + "</g>";
         }
@@ -6823,11 +6832,11 @@ std::string vectorizeMultiPass(
         //   Pass 3 path fill is a real measured micro-detail colour from the photo.
         Options p3 = options.pass3;
         p3.color_precision   = 7;   // kept for reference; DPI bypasses K-means
-        p3.corner_threshold  = 15.f;
-        p3.filter_speckle    = 1;
-        p3.path_precision    = 1;
-        p3.rdp_epsilon       = 0.3f;
-        p3.blur_radius       = 0.f; // no bilateral on chromatic HP buffer
+        p3.corner_threshold  = 45.f;  // ENH-21-FIX: was 15 — smoother micro-detail curves
+        p3.filter_speckle    = 32;    // ENH-21-FIX: was 1 — suppress fragments <32px
+        p3.path_precision    = 2;
+        p3.rdp_epsilon       = 1.2f;  // ENH-21-FIX: was 0.3 — aggressive simplification
+        p3.blur_radius       = 0.f;
         p3.bilateral_sigma_r = 5.f;
         p3.gradient_detect_thresh =
             options.pass3.gradient_detect_thresh > 0.f
@@ -6864,12 +6873,25 @@ std::string vectorizeMultiPass(
             scopeSvgIds(dpiPaths3, "p3-");
 
             float p3Opacity = options.highPassGroupOpacity > 0.f
-                              ? options.highPassGroupOpacity : kPass3Opacity;
-            char gOpen3[128];
+                              ? options.highPassGroupOpacity : 0.45f; // ENH-21-FIX: was 0.75
+            // ENH-21-FIX: wrap micro-detail in a feGaussianBlur filter group.
+            // Hard-edged micro-detail paths look like circuit traces. A 0.8px
+            // Gaussian softens them into organic texture overlays while
+            // preserving the hue and position of each detail region.
+            static std::atomic<int> p3BlurCtr{0};
+            int p3BId = ++p3BlurCtr;
+            char p3FilterId[32]; snprintf(p3FilterId, sizeof(p3FilterId), "p3blur%d", p3BId);
+            char p3FilterDef[256];
+            snprintf(p3FilterDef, sizeof(p3FilterDef),
+                "<filter id=\"%s\" x=\"-1%%\" y=\"-1%%\" width=\"102%%\" height=\"102%%\">"
+                "<feGaussianBlur stdDeviation=\"0.8\"/>"
+                "</filter>", p3FilterId);
+            char gOpen3[256];
             snprintf(gOpen3, sizeof(gOpen3),
-                "<g id=\"layer-microdetail\" style=\"opacity:%.2f\">", (double)p3Opacity);
+                "<g id=\"layer-microdetail\" filter=\"url(#%s)\" style=\"opacity:%.2f\">",
+                p3FilterId, (double)p3Opacity);
 
-            d3 = dpiDefs3;
+            d3 = std::string(p3FilterDef) + dpiDefs3;
             b3 = std::string(gOpen3) + dpiPaths3 + "</g>";
         }
         VT_LOG("vectorizeMultiPass: Pass 3 ENH-20 DPI done in %.1f ms", vt_now_ms() - ts3);
@@ -7088,20 +7110,109 @@ std::string vectorizeMultiPass(
         svg += "</defs>";
     }
 
-    // FIX-DARK-6: Insert a solid white background rect before all layers.
-    // Without this, mix-blend-mode:multiply and mix-blend-mode:overlay composite
-    // against transparent black (RGBA 0,0,0,0) -- turning every semi-transparent
-    // dark area into pure black. A white base rect ensures all blend modes behave
-    // as specified (multiply(white, color) = color; screen(black, color) = color).
+    // ENH-21: Structured SVG with semantic layers, gradient-based
+    // highlight/shadow overlays, and feGaussianBlur soft effects.
+    //
+    // Layer stack (bottom → top):
+    //   [0] white base rect          — blend-mode anchor
+    //   [1] layer-base    Pass1      — broad painterly fills
+    //   [2] layer-background Pass2a — background LCQ colour regions
+    //   [3] layer-midtones   Pass2b — foreground LCQ colour regions
+    //   [4] layer-microdetail Pass3 — chromatic HP detail (blurred)
+    //   [5] layer-highlights  Pass4 — soft-light shimmer
+    //   [6] layer-lowlights   Pass5 — shadow hue fills
+    //   [7] layer-bloom              — radialGradient soft highlight bloom
+    //   [8] layer-shadow-vignette    — feGaussianBlur shadow vignette
+    //   [9] layer-edges   Pass6     — structural ink strokes
+
+    // [0] White base rect — required for correct blend-mode compositing
     {
         char bgRect[128];
         snprintf(bgRect, sizeof(bgRect),
-            "<rect width=\"%d\" height=\"%d\" fill=\"white\"/>",
+            "<rect id=\"layer-ground\" width=\"%d\" height=\"%d\" fill=\"white\"/>",
             width, height);
         svg += bgRect;
     }
 
+    // [1-6] All pass layers
     svg += svgBody;
+
+    // [7] Soft highlight bloom — radialGradient centred on the brightest
+    // region (top-centre for sky/mountain shots). A feGaussianBlur-filtered
+    // translucent white ellipse gives an organic photographic bloom effect.
+    {
+        // Bloom gradient: transparent centre → opaque white at edges (inverted:
+        // bright centre, transparent rim). Use stop-opacity for control.
+        char bloomDefs[768];
+        float bcx = width  * 0.5f;
+        float bcy = height * 0.28f; // upper third — where sky/highlight lives
+        float brx = width  * 0.55f;
+        float bry = height * 0.40f;
+        snprintf(bloomDefs, sizeof(bloomDefs),
+            "<filter id=\"bloom-blur\" x=\"-20%%\" y=\"-20%%\" "
+                "width=\"140%%\" height=\"140%%\">"
+              "<feGaussianBlur stdDeviation=\"18\"/>"
+            "</filter>"
+            "<radialGradient id=\"bloom-grad\" "
+                "cx=\"%.1f\" cy=\"%.1f\" rx=\"%.1f\" ry=\"%.1f\" "
+                "gradientUnits=\"userSpaceOnUse\">"
+              "<stop offset=\"0\" stop-color=\"#fff\" stop-opacity=\"0.55\"/>"
+              "<stop offset=\"0.45\" stop-color=\"#fff\" stop-opacity=\"0.18\"/>"
+              "<stop offset=\"1\" stop-color=\"#fff\" stop-opacity=\"0\"/>"
+            "</radialGradient>",
+            (double)bcx, (double)bcy, (double)brx, (double)bry);
+        char bloomLayer[512];
+        snprintf(bloomLayer, sizeof(bloomLayer),
+            "<g id=\"layer-bloom\" style=\"mix-blend-mode:soft-light\"/>"
+            "  <ellipse filter=\"url(#bloom-blur)\" "
+                "fill=\"url(#bloom-grad)\" "
+                "cx=\"%.1f\" cy=\"%.1f\" rx=\"%.1f\" ry=\"%.1f\"/>"
+            "</g>",
+            (double)bcx, (double)bcy, (double)brx, (double)bry);
+        // Bloom defs go into <defs>, bloom layer goes after pass layers
+        // Wrap in <defs> inline since allDefs was already emitted
+        svg += "<defs>";
+        svg += bloomDefs;
+        svg += "</defs>";
+        svg += bloomLayer;
+    }
+
+    // [8] Shadow vignette — feGaussianBlur + radialGradient dark corners.
+    // replaces the old AO vignette which had triangle artifacts.
+    // Uses a rect filled with a radial gradient (dark at corners, transparent
+    // at centre) then blurred to create a soft photographic vignette.
+    {
+        float vcx = width  * 0.5f;
+        float vcy = height * 0.5f;
+        float vr  = std::sqrt(vcx*vcx + vcy*vcy); // half-diagonal
+        char vigDefs[512];
+        snprintf(vigDefs, sizeof(vigDefs),
+            "<filter id=\"vig-blur\" x=\"-5%%\" y=\"-5%%\" "
+                "width=\"110%%\" height=\"110%%\">"
+              "<feGaussianBlur stdDeviation=\"12\"/>"
+            "</filter>"
+            "<radialGradient id=\"vig-grad\" "
+                "cx=\"%.1f\" cy=\"%.1f\" r=\"%.1f\" "
+                "gradientUnits=\"userSpaceOnUse\">"
+              "<stop offset=\"0\" stop-color=\"#000\" stop-opacity=\"0\"/>"
+              "<stop offset=\"0.55\" stop-color=\"#000\" stop-opacity=\"0\"/>"
+              "<stop offset=\"1\" stop-color=\"#000\" stop-opacity=\"0.35\"/>"
+            "</radialGradient>",
+            (double)vcx, (double)vcy, (double)vr);
+        char vigLayer[512];
+        snprintf(vigLayer, sizeof(vigLayer),
+            "<g id=\"layer-shadow-vignette\"/>"
+            "  <rect filter=\"url(#vig-blur)\" "
+                "fill=\"url(#vig-grad)\" "
+                "width=\"%d\" height=\"%d\"/>"
+            "</g>",
+            width, height);
+        svg += "<defs>";
+        svg += vigDefs;
+        svg += "</defs>";
+        svg += vigLayer;
+    }
+
     svg += "</svg>";
 
     const double totalMs = vt_now_ms() - t0;
