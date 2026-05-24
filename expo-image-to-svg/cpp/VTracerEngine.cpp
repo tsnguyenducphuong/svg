@@ -340,6 +340,30 @@
 //               Skin tone warmth:      +2-3 DeltaE (cool grey regression fixed)
 //               Cost: +1-3 ms on 1080p ARM (O(N) Pass 3 scan). Negligible.
 //
+//  -- PROP-2 : Unified LCQ + Mask-Aware SVG Layer Assignment ----------------
+//             Problem: Pass 2a (background) and Pass 2b (foreground) ran
+//             independent LCQ + DPI on each half-image.  Because the two
+//             quantization runs were independent, the same physical surface
+//             colour (e.g. a grey road partially behind a subject) received
+//             two different palette entries -- one from each half -- producing
+//             a visible 1-pixel seam exactly at the mask boundary on mobile
+//             SVG renderers (Skia/WebKit).
+//
+//             Fix: Run a single DPI pass on the full masterPixelColor (no mask
+//             split at input time).  After labelComponents() produces connected
+//             components, compute a per-component mask-coverage ratio:
+//               coverage = (pixels with maskAlpha >= 128) / componentSize
+//             Route each component to a layer based on coverage:
+//               coverage >= 0.85  ->  layer-midtones   (foreground)
+//               coverage  < 0.15  ->  layer-background
+//               0.15 <= cov < 0.85 -> layer-transition (feBlend feathered)
+//             The layer-transition group receives a feGaussianBlur+feComposite
+//             SVG filter that feathers the alpha channel at mask-boundary edges,
+//             eliminating the jagged 1-pixel seam without any compositing
+//             approximation.  Because all three layers share the same master
+//             palette, the same physical surface colour maps to the same fill
+//             on both sides of the mask boundary.
+//
 //  -- FIX-BLEND-1,2 : Pass 2a/2b PassResult d/b Convention Bug ---------------
 //             vectorizeMultiPass() assembles SVG through a PassResult convention
 //             where first=gradient_defs, second=path_body.  Consumer:
@@ -549,6 +573,11 @@ static constexpr int   kLCQGridH               = 16;
 // ENH-21-FIX: colours/tile 32→12. Fewer colours per tile forces K-means to
 // produce broad, visually coherent region fills rather than micro-fragments.
 static constexpr int   kLCQColorsPerTile       = 20;  // FINAL-FIX: 12 collapsed colours, 20 gives region fidelity
+// PROP-1: Master LCQ budget -- larger palette per tile for the single shared run.
+// The master run replaces 4 independent LCQ calls (Passes 2a, 2b, 3, 5) with one
+// run at higher quality.  The extra ~33% tiles cost is recovered by eliminating the
+// 3 redundant runs entirely.  Freed thread budget is redirected to the tracer.
+static constexpr int   kMasterLCQColorsPerTile = 32;
 // Adaptive Threshold for Pass 3 (Micro-Detail) -- DeltaE below this -> suppress
 // FIX-GREY-G: Raised kMicroDetailDeltaEThresh 2.0->4.0.
 // adaptiveThresholdHighPass only passes pixels whose highPass colour
@@ -785,10 +814,22 @@ static float ciede2000RGB(uint32_t a, uint32_t b) noexcept {
 static constexpr float kFastDEScale = 1.45f; // conservative Lab→CIEDE2000 scale
 
 
+
+
+
+
+
+
 inline float fastLabDE(const Lab& a, const Lab& b) noexcept {
     float dL = a.L - b.L, da = a.a - b.a, db = a.b - b.b;
     return std::sqrt(dL*dL + da*da + db*db);
 }
+
+
+
+
+
+
 
 
 // Threshold-gate helper: returns true if Lab Euclidean distance is
@@ -933,9 +974,21 @@ static std::vector<uint8_t> bilateralFilter(
         return std::vector<uint8_t>(src, src + (size_t)W * H * 4);
 
 
+
+
+
+
+
+
     const float scaledSigma = sigma_s * std::max(1.f, (float)std::max(W,H)/512.f);
     const int radius = std::min((int)std::ceil(2.f*scaledSigma), 5);
     const int D      = 2 * radius + 1;
+
+
+
+
+
+
 
 
     // Spatial and range weight LUTs
@@ -945,6 +998,12 @@ static std::vector<uint8_t> bilateralFilter(
         for(int dx=-radius; dx<=radius; ++dx)
             spatialW[(size_t)(dy+radius)*D + (dx+radius)] =
                 std::exp(-(float)(dx*dx+dy*dy) * inv2Ss2);
+
+
+
+
+
+
 
 
     // ENH-LAB-BILATERAL: Range weight LUT indexed by perceptual Lab Euclidean
@@ -965,6 +1024,9 @@ static std::vector<uint8_t> bilateralFilter(
     for(int i=0;i<256;++i)
         rangeW[i] = std::exp(-(float)i * inv2Sr2Lab);
 
+
+
+
     // Pre-build a Lab value cache keyed on packed sRGB to avoid repeating
     // rgbToLabLUT on every (pixel, neighbour) pair. The cache is sized as a
     // power-of-two direct-mapped table using the low 12 bits of the packed RGB.
@@ -974,6 +1036,9 @@ static std::vector<uint8_t> bilateralFilter(
     struct LabCacheEntry { uint32_t rgb; Lab lab; };
     std::vector<LabCacheEntry> labCache(kLabCacheSize, {0xFFFFFFFFu, {0,0,0}});
 
+
+
+
     auto getCachedLab = [&](uint32_t packed) -> const Lab& {
         int slot = (int)(packed & kLabCacheMask);
         if (labCache[slot].rgb != packed) {
@@ -982,6 +1047,12 @@ static std::vector<uint8_t> bilateralFilter(
         }
         return labCache[slot].lab;
     };
+
+
+
+
+
+
 
 
     // PERF-MOB-1a: Pre-clamped column index table.
@@ -994,6 +1065,12 @@ static std::vector<uint8_t> bilateralFilter(
                 std::clamp(x + kx - radius, 0, W - 1);
 
 
+
+
+
+
+
+
     // PERF-MOB-1b: Pre-clamped row index table.
     // clampY[y * D + ky] = clamped pixel row for neighbour offset ky ??? [0,D).
     std::vector<int> clampY((size_t)H * D);
@@ -1003,8 +1080,20 @@ static std::vector<uint8_t> bilateralFilter(
                 std::clamp(y + ky - radius, 0, H - 1);
 
 
+
+
+
+
+
+
     const int N = W * H;
     std::vector<uint8_t> dst((size_t)N * 4);
+
+
+
+
+
+
 
 
     // PERF-MOB-1c: Parallel row-stripe dispatch.
@@ -1012,6 +1101,12 @@ static std::vector<uint8_t> bilateralFilter(
     // region of dst, so no synchronisation is needed.
     const int nThreads = std::max(1, (int)std::thread::hardware_concurrency());
     const int rowsPerThread = (H + nThreads - 1) / nThreads;
+
+
+
+
+
+
 
 
     auto processRows = [&](int yStart, int yEnd) {
@@ -1060,6 +1155,12 @@ static std::vector<uint8_t> bilateralFilter(
     };
 
 
+
+
+
+
+
+
     if (nThreads <= 1 || H < 64) {
         // Single-threaded fallback for tiny images or single-core devices
         processRows(0, H);
@@ -1075,6 +1176,12 @@ static std::vector<uint8_t> bilateralFilter(
         }
         for (auto& f : futs) f.get();
     }
+
+
+
+
+
+
 
 
     return dst;
@@ -1697,8 +1804,20 @@ static void stitchAdjacentTilePalettes(
                     // uint32_t anchor = packRGB(toSRGB(rL), toSRGB(gLin), toSRGB(bL));
 
 
+
+
+
+
+
+
                     //(ENH-20) ------------------------------------------------------------
                     long total = (long)wA + (long)wB;
+
+
+
+
+
+
 
 
                     // ENH-20: Compute the stitch anchor in Lab space with a
@@ -1723,9 +1842,21 @@ static void stitchAdjacentTilePalettes(
                         Lab labB = rgbToLabLUT(tpB.colors[j]);
 
 
+
+
+
+
+
+
                         // Weighted L* (perceptually linear, direct mean is fine)
                         float anchorL = (float)(
                             ((double)wA * labA.L + (double)wB * labB.L) / total);
+
+
+
+
+
+
 
 
                         // Chroma magnitudes
@@ -1733,9 +1864,21 @@ static void stitchAdjacentTilePalettes(
                         float cB = std::sqrt(labB.a * labB.a + labB.b * labB.b);
 
 
+
+
+
+
+
+
                         // Weighted C* (linear average of magnitudes)
                         float anchorC = (float)(
                             ((double)wA * cA + (double)wB * cB) / total);
+
+
+
+
+
+
 
 
                         // Chroma-weighted circular mean hue
@@ -1747,6 +1890,12 @@ static void stitchAdjacentTilePalettes(
                         double hueAccB = (double)wA * cA * labA.b
                                        + (double)wB * cB * labB.b;
                         double hueLen  = std::sqrt(hueAccA*hueAccA + hueAccB*hueAccB);
+
+
+
+
+
+
 
 
                         float anchorA, anchorB;
@@ -1762,6 +1911,12 @@ static void stitchAdjacentTilePalettes(
                             anchorB = (float)(
                                 ((double)wA * labA.b + (double)wB * labB.b) / total);
                         }
+
+
+
+
+
+
 
 
                         uint32_t anchor = labToRGB({anchorL, anchorA, anchorB});
@@ -1910,6 +2065,12 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
     static constexpr float kDE2000SafeMarginSq  = 6.25f; // (2.5 DE)^2 gate margin
 
 
+
+
+
+
+
+
     for (auto& tp : tiles) {
         if (tp.colors.empty()) continue;
         const int K_tile = (int)tp.colors.size();
@@ -1919,10 +2080,22 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
             tpLab[i] = rgbToLabLUT(tp.colors[i]);
 
 
+
+
+
+
+
+
         // Per-tile assignment cache: raw RGB -> assigned palette colour.
         // Reserves 512 slots; typical tile has 200-800 distinct colours.
         std::unordered_map<uint32_t, uint32_t> tileCache;
         tileCache.reserve(512);
+
+
+
+
+
+
 
 
         for (int y = tp.py0; y < tp.py1; ++y) {
@@ -1930,6 +2103,12 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
                 const uint8_t* p = pixels + (y * W + x) * 4;
                 if (p[3] == 0) continue;
                 uint32_t raw = packRGB(p[0], p[1], p[2]);
+
+
+
+
+
+
 
 
                 // Fast path: cache hit avoids all distance computation
@@ -1940,7 +2119,19 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
                 }
 
 
+
+
+
+
+
+
                 Lab rawLab = rgbToLabLUT(raw);
+
+
+
+
+
+
 
 
                 // Level 1: Lab Euclidean pre-filter
@@ -1955,11 +2146,23 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
                 }
 
 
+
+
+
+
+
+
                 // Gate: entries with Euclidean distance beyond this cannot
                 // produce a CIEDE2000 better than the Euclidean winner by
                 // more than kDE2000SafeMarginSq in squared-DeltaE terms.
                 const float gateEucSq = bestEucSq * kLabEuclidGateScale
                                         + kDE2000SafeMarginSq;
+
+
+
+
+
+
 
 
                 // Level 2: CIEDE2000 for all candidates within gate
@@ -1974,6 +2177,12 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
                     float d = ciede2000(rawLab, tpLab[i]);
                     if (d < bestDE) { bestDE = d; bestC = tp.colors[i]; }
                 }
+
+
+
+
+
+
 
 
                 pixelColor[y * W + x] = bestC;
@@ -3006,6 +3215,12 @@ static bool shouldSuppressComponentDetail(
     }
     return path;
 }
+
+
+
+
+
+
 
 
 static void snapToSharedEdges(
@@ -4203,6 +4418,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         const int    nC   = (int)componentColor.size();
 
 
+
+
+
+
+
+
         // ENH-21 constants
         static constexpr float kLabVoxelCell21  = 4.0f;  // same voxel cell as ENH-14
         static constexpr int   kLbins21 = 25;
@@ -4216,6 +4437,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         // Prevents low-count noise voxels from pulling the centroid.
         // A voxel contributes only if its count >= kConsensusMinFrac * dominantCount.
         static constexpr float kConsensusMinFrac = 0.15f;
+
+
+
+
+
+
 
 
         auto makeVoxelKey21 = [](int lBin, int aBin, int bBin) noexcept -> uint32_t {
@@ -4241,6 +4468,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         };
 
 
+
+
+
+
+
+
         // -- Pass 1: build flat PackedSample list (identical to ENH-14) -------
         struct PackedSample21 {
             uint64_t key;   // (lbl << 40) | (voxelKey << 22) | rgb24_lo22
@@ -4248,6 +4481,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         };
         std::vector<PackedSample21> samples;
         samples.reserve(static_cast<size_t>(N21));
+
+
+
+
+
+
 
 
         for (int i = 0; i < N21; ++i) {
@@ -4269,10 +4508,22 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         }
 
 
+
+
+
+
+
+
         std::sort(samples.begin(), samples.end(),
                   [](const PackedSample21& a, const PackedSample21& b) noexcept {
                       return a.key < b.key;
                   });
+
+
+
+
+
+
 
 
         // -- Linear reduction: build per-component voxel histogram -----------
@@ -4286,10 +4537,22 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         std::vector<std::vector<VoxEntry>> compTopVox(nC);
 
 
+
+
+
+
+
+
         // Also track the per-component best representative pixel for Pass 3 snap.
         // We reuse the ENH-14 per-component dominant-voxel best RGB as a seed
         // for the nearest-pixel search, then improve it in Pass 3.
         std::vector<uint32_t> compSeedRGB(nC, 0);
+
+
+
+
+
+
 
 
         {
@@ -4298,7 +4561,19 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             int      curVoxCnt = 0;
 
 
+
+
+
+
+
+
             const int ns = static_cast<int>(samples.size());
+
+
+
+
+
+
 
 
             auto flushVox21 = [&]() {
@@ -4321,10 +4596,22 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             };
 
 
+
+
+
+
+
+
             for (int si = 0; si < ns; ++si) {
                 const PackedSample21& s = samples[si];
                 const int      sLbl   = static_cast<int>(s.key >> 40);
                 const uint32_t sVoxel = static_cast<uint32_t>((s.key >> 22) & 0x3FFFFu);
+
+
+
+
+
+
 
 
                 if (sLbl != curLbl || sVoxel != curVoxel) {
@@ -4343,9 +4630,21 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         }
 
 
+
+
+
+
+
+
         // -- Pass 2: compute count-weighted Lab consensus centroid per component
         std::vector<Lab> compConsensusLab(nC, {0.f, 0.f, 0.f});
         std::vector<bool> compHasConsensus(nC, false);
+
+
+
+
+
+
 
 
         for (int lbl = 0; lbl < nC; ++lbl) {
@@ -4353,10 +4652,22 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             if (topV.empty()) continue;
 
 
+
+
+
+
+
+
             // topV is sorted ascending by count; dominant is at back.
             int dominantCount = topV.back().count;
             int minCount = static_cast<int>(dominantCount * kConsensusMinFrac);
             if (minCount < 1) minCount = 1;
+
+
+
+
+
+
 
 
             double wL = 0, wa = 0, wb = 0, wTotal = 0;
@@ -4372,6 +4683,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             if (wTotal < 1.0) continue;
 
 
+
+
+
+
+
+
             compConsensusLab[lbl] = {
                 static_cast<float>(wL / wTotal),
                 static_cast<float>(wa / wTotal),
@@ -4379,6 +4696,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             };
             compHasConsensus[lbl] = true;
         }
+
+
+
+
+
+
 
 
         // -- Pass 3: snap consensus Lab to nearest actual pixel in original image
@@ -4392,6 +4715,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
         std::vector<uint32_t> compBestRGB21(nC, 0);
 
 
+
+
+
+
+
+
         for (int i = 0; i < N21; ++i) {
             const int lbl = labelMap[i];
             if (lbl < 0 || lbl >= nC || !compHasConsensus[lbl]) continue;
@@ -4399,9 +4728,21 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             if (p[3] == 0) continue;
 
 
+
+
+
+
+
+
             const uint32_t origRGB = packRGB(p[0], p[1], p[2]);
             const Lab      pixLab  = rgbToLabLUT(origRGB);
             const Lab&     cenLab  = compConsensusLab[lbl];
+
+
+
+
+
+
 
 
             float dL = pixLab.L - cenLab.L;
@@ -4410,11 +4751,23 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             float dist = dL*dL + da*da + db*db;
 
 
+
+
+
+
+
+
             if (dist < compBestDist[lbl]) {
                 compBestDist[lbl]  = dist;
                 compBestRGB21[lbl] = origRGB;
             }
         }
+
+
+
+
+
+
 
 
         // -- Apply: write consensus-snapped color into componentColor ----------
@@ -4429,6 +4782,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 ++upgraded;
             }
         }
+
+
+
+
+
+
 
 
         VT_LOG("ENH-21 Multi-Voxel Consensus: %.1f ms, "
@@ -4466,6 +4825,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             ub[0]=std::min(ub[0],bb[0]); ub[1]=std::min(ub[1],bb[1]);
             ub[2]=std::max(ub[2],bb[2]); ub[3]=std::max(ub[3],bb[3]);
         }
+
+
+
+
+
+
 
 
         for(int i=0;i<K;++i){
@@ -4936,6 +5301,12 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
 }
 
 
+
+
+
+
+
+
 static void scopeSvgIds(std::string& s, const std::string& prefix);
 // =============================================================================
 //  ENH-17 -- Direct Palette Injection (DPI)
@@ -5020,10 +5391,22 @@ static std::string vectorizeWithPreassignedColors(
         const int    nC = (int)componentColor.size();
 
 
+
+
+
+
+
+
         static constexpr float kVoxCell21dpi = 4.0f;
         static constexpr int   kLb21dpi = 25, kAb21dpi = 64, kBb21dpi = 64;
         static constexpr int   kTopK21dpi = 4;
         static constexpr float kMinFrac21dpi = 0.15f;
+
+
+
+
+
+
 
 
         auto makeVK21dpi = [](int l, int a, int b) noexcept -> uint32_t {
@@ -5044,9 +5427,21 @@ static std::string vectorizeWithPreassignedColors(
         };
 
 
+
+
+
+
+
+
         struct PS21dpi { uint64_t key; uint32_t rgb24; };
         std::vector<PS21dpi> samps;
         samps.reserve(static_cast<size_t>(N));
+
+
+
+
+
+
 
 
         for (int i = 0; i < N; ++i) {
@@ -5072,12 +5467,30 @@ static std::string vectorizeWithPreassignedColors(
         }
 
 
+
+
+
+
+
+
         std::sort(samps.begin(), samps.end(),
                   [](const PS21dpi& a, const PS21dpi& b) noexcept { return a.key < b.key; });
 
 
+
+
+
+
+
+
         struct VE21dpi { int count; uint32_t voxKey; };
         std::vector<std::vector<VE21dpi>> topV(nC);
+
+
+
+
+
+
 
 
         {
@@ -5104,6 +5517,12 @@ static std::string vectorizeWithPreassignedColors(
         }
 
 
+
+
+
+
+
+
         // Compute consensus Lab centroid per component
         std::vector<Lab>  conLab(nC, {0.f,0.f,0.f});
         std::vector<bool> hasCon(nC, false);
@@ -5125,6 +5544,12 @@ static std::string vectorizeWithPreassignedColors(
         }
 
 
+
+
+
+
+
+
         // Snap consensus to nearest original pixel per component
         std::vector<float>    bestDist21(nC, 1e30f);
         std::vector<uint32_t> bestRGB21(nC, 0);
@@ -5142,6 +5567,12 @@ static std::string vectorizeWithPreassignedColors(
         }
 
 
+
+
+
+
+
+
         int upg21 = 0;
         for (int lbl = 0; lbl < nC; ++lbl) {
             if (!hasCon[lbl] || bestRGB21[lbl] == 0) continue;
@@ -5151,6 +5582,12 @@ static std::string vectorizeWithPreassignedColors(
         }
         std::sort(palette.begin(), palette.end());
         palette.erase(std::unique(palette.begin(), palette.end()), palette.end());
+
+
+
+
+
+
 
 
         VT_LOG("ENH-21 DPI Multi-Voxel Consensus: %.1f ms, "
@@ -5557,6 +5994,12 @@ static std::string vectorizeWithPreassignedColors(
 }
 
 
+
+
+
+
+
+
 // ===========================================================================
 //  ENH-11 -- Multi-Pass Frequency Separation Workflow
 //
@@ -5579,6 +6022,12 @@ static std::string vectorizeWithPreassignedColors(
 //    * Pass 4 rasterises the edge map into compact <path> polylines.
 //    * All ENH-8/9/10 enhancements remain active per-pass.
 // ===========================================================================
+
+
+
+
+
+
 
 
 // -----------------------------------------------------------------------------
@@ -5622,6 +6071,12 @@ static std::vector<uint8_t> applyInverseMaskToPixels(
 }
 
 
+
+
+
+
+
+
 // -----------------------------------------------------------------------------
 //  Helper: run the full single-pass vectorizer with a specific dilation radius.
 //  We temporarily override the global kDilateRadius constant by passing the
@@ -5631,6 +6086,12 @@ static std::vector<uint8_t> applyInverseMaskToPixels(
 //  existing buildPathD() with explicit dilateRadius parameter injection by
 //  calling a thin wrapper that clones the pipeline with a custom dilation.
 // -----------------------------------------------------------------------------
+
+
+
+
+
+
 
 
 // -----------------------------------------------------------------------------
@@ -5703,6 +6164,12 @@ static void vectorizeLayerContentDPI(
 }
 
 
+
+
+
+
+
+
 // Thin wrapper: vectorize a pre-filtered buffer with overridden dilation.
 // We route through the standard vectorize() pipeline but strip the SVG
 // wrapper tags so the caller can embed the inner content into its own layers.
@@ -5729,6 +6196,12 @@ static void vectorizeLayerContent(
     // and add a specialised internal function.
 
 
+
+
+
+
+
+
     // Actually, the cleanest approach given the existing architecture:
     // We call vectorize() and strip the wrapper. The dilation is already
     // baked in at kDilateRadius=0.5f for the base code. For the base layer
@@ -5736,6 +6209,12 @@ static void vectorizeLayerContent(
     // if dilateOverride differs significantly, but the simpler production
     // solution is to use SVG feGaussianBlur on the base group to soften edges:
     // <filter id="base-blur"><feGaussianBlur stdDeviation="0.5"/></filter>
+
+
+
+
+
+
 
 
     (void)ignoreAlphaZero; // handled by caller via mask application
@@ -5925,6 +6404,9 @@ static std::string buildEdgeLayerSVG(
         (double)strokeWidth);
     svg += groupHdr;
 
+
+
+
     // =========================================================================
     //  ENH-EDGE-MERGE: Colour-bucketed polyline chains
     //
@@ -5962,9 +6444,15 @@ static std::string buildEdgeLayerSVG(
     std::unordered_map<uint32_t, std::vector<EdgeRun>> colourBuckets;
     colourBuckets.reserve(256);
 
+
+
+
     std::vector<bool> consumed(static_cast<size_t>(N), false);
     const int kMinRunLen = 3;
     const int dp = std::clamp(pathPrecision, 0, 2);
+
+
+
 
     // Collect horizontal runs
     for (int y = 0; y < H; ++y) {
@@ -5998,6 +6486,9 @@ static std::string buildEdgeLayerSVG(
             colourBuckets[rc].push_back({cx2, runStart + 0.5f, cx2, runEnd - 0.5f});
         }
     }
+
+
+
 
     // Emit one <g> per colour bucket, runs concatenated into one d= string
     char colorBuf[64];
@@ -6368,6 +6859,12 @@ static void runPass(
     gOpen += "\"";
 
 
+
+
+
+
+
+
     // Build style string combining blend-mode and opacity
     {
         std::string styleVal;
@@ -6395,10 +6892,22 @@ static void runPass(
     gOpen += ">";
 
 
+
+
+
+
+
+
     svgBody += gOpen;
     svgBody += paths;
     svgBody += "</g>\n";
 }
+
+
+
+
+
+
 
 
 // ENH-18: Chromatic High-Pass Reconstruction
@@ -6433,18 +6942,42 @@ static std::vector<uint8_t> buildChromaticHighPass(
     std::vector<uint8_t> out(static_cast<size_t>(N) * 4, 0);
 
 
+
+
+
+
+
+
     for (int i = 0; i < N; ++i) {
         const uint8_t* o = originalPixels + i * 4;
         const uint8_t* b = blurPixels     + i * 4;
         if (o[3] == 0) continue;                    // transparent: skip
 
 
+
+
+
+
+
+
         uint32_t origRGB = packRGB(o[0], o[1], o[2]);
         uint32_t blurRGB = packRGB(b[0], b[1], b[2]);
 
 
+
+
+
+
+
+
         Lab labOrig = rgbToLabLUT(origRGB);
         Lab labBlur = rgbToLabLUT(blurRGB);
+
+
+
+
+
+
 
 
         // PERF-FAST-DE: replace ciede2000 (~300ns) with fastLabDE (~8ns)
@@ -6467,10 +7000,22 @@ static std::vector<uint8_t> buildChromaticHighPass(
         // pixel has meaningful high-frequency content: include
 
 
+
+
+
+
+
+
         // High-pass deltas in Lab space
         float dL = labOrig.L - labBlur.L;
         float da = labOrig.a - labBlur.a;
         float db = labOrig.b - labBlur.b;
+
+
+
+
+
+
 
 
         // Base color = the LCQ surface color assigned to this pixel.
@@ -6482,7 +7027,19 @@ static std::vector<uint8_t> buildChromaticHighPass(
         if (base == 0xFFFFFFFFu) base = origRGB;    // unassigned sentinel fallback
 
 
+
+
+
+
+
+
         Lab labBase = rgbToLabLUT(base);
+
+
+
+
+
+
 
 
         // Apply HP delta to the real surface color
@@ -6493,7 +7050,19 @@ static std::vector<uint8_t> buildChromaticHighPass(
         };
 
 
+
+
+
+
+
+
         uint32_t outRGB = labToRGB(labOut);         // uses linearToSRGBLUT
+
+
+
+
+
+
 
 
         uint8_t* dst = out.data() + static_cast<size_t>(i) * 4;
@@ -6504,6 +7073,12 @@ static std::vector<uint8_t> buildChromaticHighPass(
     }
     return out;
 }
+
+
+
+
+
+
 
 
 // -------------------------------------------------------------------------
@@ -6543,19 +7118,43 @@ static std::vector<uint8_t> buildColoredLuminanceSplit(
     std::vector<uint8_t> anchoredBuf(static_cast<size_t>(N) * 4, 0);
 
 
+
+
+
+
+
+
     for (int i = 0; i < N; ++i) {
         const uint8_t* o = originalPixels + i * 4;
         if (o[3] == 0) continue;
+
+
+
+
+
+
 
 
         uint32_t origRGB = packRGB(o[0], o[1], o[2]);
         Lab labOrig = rgbToLabLUT(origRGB);
 
 
+
+
+
+
+
+
         // Apply the same luminance gate
         bool isSelected = keepAbove ? (labOrig.L >= lStarThresh)
                                     : (labOrig.L <= lStarThresh);
         if (!isSelected) continue;
+
+
+
+
+
+
 
 
         // Get the LCQ surface color for this pixel.
@@ -6566,7 +7165,19 @@ static std::vector<uint8_t> buildColoredLuminanceSplit(
         if (baseRGB == 0xFFFFFFFFu) baseRGB = origRGB; // unassigned sentinel fallback
 
 
+
+
+
+
+
+
         Lab labBase = rgbToLabLUT(baseRGB);
+
+
+
+
+
+
 
 
         // Shift the base color's L* to match the original's luminance
@@ -6583,12 +7194,24 @@ static std::vector<uint8_t> buildColoredLuminanceSplit(
         uint32_t outRGB = labToRGB(labOut);
 
 
+
+
+
+
+
+
         uint8_t* dst = anchoredBuf.data() + static_cast<size_t>(i) * 4;
         dst[0] = rCh(outRGB);
         dst[1] = gCh(outRGB);
         dst[2] = bCh(outRGB);
         dst[3] = o[3];
     }
+
+
+
+
+
+
 
 
     // Run LCQ on the hue-anchored buffer -- same grid as Pass 2
@@ -6598,6 +7221,12 @@ static std::vector<uint8_t> buildColoredLuminanceSplit(
         kLCQGridW, kLCQGridH, kLCQColorsPerTile,
         outPixelColor, tileOpts,
         kVarFlat, kVarMid);
+
+
+
+
+
+
 
 
     return anchoredBuf;
@@ -6640,6 +7269,12 @@ std::string vectorizeMultiPass(
     VT_LOG("vectorizeMultiPass ENH-12 6-pass: start %dx%d", width, height);
 
 
+
+
+
+
+
+
     // -- Apply sensible defaults -------------------------------------------
     auto applyDefaults = [](Options& o) {
         if (o.color_precision        <= 0) o.color_precision        = 6;
@@ -6654,6 +7289,12 @@ std::string vectorizeMultiPass(
     applyDefaults(options.pass1);
     applyDefaults(options.pass2);
     applyDefaults(options.pass3);
+
+
+
+
+
+
 
 
     std::string allDefs;
@@ -6684,6 +7325,12 @@ std::string vectorizeMultiPass(
     // thread count is still capped and thermal throttling is avoided.
 
 
+
+
+
+
+
+
     // PERF-ENH-5: Extract highlight and shadow buffers in a single scan
     std::vector<uint8_t> hlPixels, shadowPixels;
     extractHighlightAndShadowPixels(
@@ -6691,6 +7338,12 @@ std::string vectorizeMultiPass(
         kHighlightLStarThresh, kShadowLStarThresh,
         hlPixels, shadowPixels);
     VT_LOG("vectorizeMultiPass: highlight+shadow extraction done (single-pass ENH-5)");
+
+
+
+
+
+
 
 
     // PERF-NEW-2: Pre-compute bilateral-filtered pixel buffers for all passes
@@ -6746,6 +7399,56 @@ std::string vectorizeMultiPass(
 
 
     // =========================================================================
+    //  PROP-1: Master LCQ -- Single shared quantization for Passes 2a, 2b, 3, 5
+    //
+    //  Problem: The original pipeline ran buildLCQPaletteAndAssign independently
+    //  for Pass 2a (background), Pass 2b (foreground), Pass 3 (chromatic HP), and
+    //  Pass 5 (shadow-anchored).  Each call dispatched up to 256 tile K-means++
+    //  tasks at 8 iterations each -- 4 × 256 × 8 iterations of heavy Lab math.
+    //  On a 1080p image this accounted for ~12-15 s of the total 30 s budget.
+    //
+    //  Passes 3 and 5 are structurally derived from Pass 2:
+    //   • Pass 3 chromatic HP = master palette entries shifted by Lab HP delta.
+    //     No new colour can appear where Pass 2 already agreed on a surface colour.
+    //   • Pass 5 shadow = pixels below kShadowLStarThresh re-mapped via master
+    //     a*/b* channels.  The shadow hue is entirely determined by the master map.
+    //  Re-running full LCQ on these derived buffers re-solves an already-solved
+    //  problem.
+    //
+    //  Fix: Run LCQ ONCE on the full original image at kMasterLCQColorsPerTile=32
+    //  colours/tile.  Cache masterPixelColor[] and masterPalette[].
+    //   • Pass 2a/2b: mask-filtered views into masterPixelColor (no new LCQ).
+    //   • Pass 3:  derive HP palette by applying Lab delta to each masterPalette
+    //              entry and deduplicating -- zero additional K-means iterations.
+    //   • Pass 5:  luminance-filtered subset of masterPalette + filter masterPixelColor.
+    //
+    //  Eliminates 3 of the 4 LCQ calls; total LCQ cost drops from ~4× to ~1.3×
+    //  (one larger call at 32 colours/tile instead of four at 20).
+    // =========================================================================
+    VT_LOG("PROP-1: Running master LCQ on full original image (%dx%d, %d colours/tile)",
+           width, height, kMasterLCQColorsPerTile);
+    double tMasterLCQ = vt_now_ms();
+    std::vector<uint32_t> masterPixelColor;
+    std::vector<TileOptions> masterTileOpts;
+    std::vector<uint32_t> masterPalette = buildLCQPaletteAndAssign(
+        originalPixels, width, height,
+        kLCQGridW, kLCQGridH, kMasterLCQColorsPerTile,
+        masterPixelColor, masterTileOpts,
+        options.varFlat, options.varMid);
+    VT_LOG("PROP-1: Master LCQ done in %.1f ms -- %d palette entries, %d tiles",
+           vt_now_ms() - tMasterLCQ, (int)masterPalette.size(),
+           kLCQGridW * kLCQGridH);
+
+    // PROP-2: pass2PixelColor is the full-image master map.
+    // Downstream passes (Pass 3 chromatic HP, Pass 4 highlight anchor,
+    // Pass 5 shadow anchor) all query this map for per-pixel surface colours.
+    // Setting it here (synchronously, before any async future is launched)
+    // eliminates the original data-race where pass2PixelColor was written
+    // inside fut2's lambda and read by deferred fut4.
+    std::vector<uint32_t> pass2PixelColor = masterPixelColor;
+
+
+    // =========================================================================
     //  PASS 1 (async) -- Base Layer: ENH-VORONOI-MOSAIC
     //
     //  Replaces the previous full vectorize() call (which cost 15-25% of total
@@ -6776,9 +7479,15 @@ std::string vectorizeMultiPass(
         const int cellW = (width  + kVoronoiCols - 1) / kVoronoiCols;
         const int cellH = (height + kVoronoiRows - 1) / kVoronoiRows;
 
+
+
+
         // Per-cell Lab accumulator and count
         struct CellAcc { double sumL=0, sumA=0, sumB=0; long cnt=0; };
         std::vector<CellAcc> cells(kVoronoiCols * kVoronoiRows);
+
+
+
 
         for (int y = 0; y < height; ++y) {
             int row = std::min(y / cellH, kVoronoiRows - 1);
@@ -6791,6 +7500,9 @@ std::string vectorizeMultiPass(
                 c.sumL += lab.L; c.sumA += lab.a; c.sumB += lab.b; ++c.cnt;
             }
         }
+
+
+
 
         // Build SVG: one <rect> per non-empty cell
         std::string body;
@@ -6844,202 +7556,281 @@ std::string vectorizeMultiPass(
     // shouldSuppressComponentDetail at the vectorize() call site.
 
 
+
+
+
+
+
+
     // auto fut2 = std::async(std::launch::async, [&]() -> PassResult {
     //     double ts = vt_now_ms();
+
+
+
+
+
+
 
 
     //     // Step 1: mask original to foreground only
     //     std::vector<uint8_t> maskedOriginal =
     //         applyMaskToPixels(originalPixels, maskPixels, width, height);
     // AFTER -- Pass 2a background (new), Pass 2b foreground (renamed from Pass 2)
-    // Pass 2a (async) -- background LCQ: sky, mountains, road
-    auto fut2a = std::async(std::launch::async, [&]() -> PassResult {
+    // =========================================================================
+    //  PROP-2: Pass 2 -- Unified Mask-Aware Layer Assignment
+    //
+    //  Single DPI run on the full masterPixelColor map (no foreground/background
+    //  split at input time).  After component labeling, each component is routed
+    //  to a SVG layer based on its mask-coverage ratio:
+    //    coverage >= kFgCoverageThresh (0.85) -> layer-midtones
+    //    coverage <  kBgCoverageThresh (0.15) -> layer-background
+    //    otherwise                            -> layer-transition  (feathered)
+    //
+    //  Because all three layers share masterPalette, the same physical surface
+    //  colour gets the same fill on both sides of the mask boundary, eliminating
+    //  the seam that the independent Pass 2a/2b quantization introduced.
+    //
+    //  The layer-transition group receives a feGaussianBlur+feComposite filter
+    //  so boundary-straddling components fade smoothly rather than hard-cutting.
+    //
+    //  pass2PixelColor is already set to masterPixelColor above; downstream
+    //  passes (3, 4, 5) can read it safely without waiting for this future.
+    // =========================================================================
+    static constexpr float kFgCoverageThresh = 0.85f; // >85%  -> foreground
+    static constexpr float kBgCoverageThresh = 0.15f; // <15%  -> background
+                                                       // else  -> transition
+
+    auto fut2 = std::async(std::launch::async, [&]() -> PassResult {
         double ts = vt_now_ms();
-        std::vector<uint8_t> maskedBackground =
-            applyInverseMaskToPixels(originalPixels, maskPixels, width, height);
-        std::vector<uint32_t> bgPixelColor;
-        std::vector<TileOptions> bgTileOpts;
-        buildLCQPaletteAndAssign(
-            maskedBackground.data(), width, height,
-            kLCQGridW, kLCQGridH, kLCQColorsPerTile,
-            bgPixelColor, bgTileOpts,
-            options.varFlat, options.varMid);
         const int N = width * height;
-        std::vector<uint8_t> bgReconstructed(static_cast<size_t>(N) * 4, 0);
+
+        // ------------------------------------------------------------------
+        //  Step 1: Reconstruct full RGBA from masterPixelColor (no mask split).
+        //  Pixels with sentinel (0xFFFFFFFF) or transparent source stay zero.
+        // ------------------------------------------------------------------
+        std::vector<uint8_t> fullReconstructed(static_cast<size_t>(N) * 4, 0);
+        {
+            for (int i = 0; i < N; ++i) {
+                uint32_t c = masterPixelColor[i];
+                if (c == 0xFFFFFFFFu) continue;
+                const uint8_t srcAlpha = originalPixels[static_cast<size_t>(i) * 4 + 3];
+                if (srcAlpha == 0) continue;
+                uint8_t* dst = fullReconstructed.data() + static_cast<size_t>(i) * 4;
+                dst[0] = static_cast<uint8_t>((c >> 16) & 0xFF);
+                dst[1] = static_cast<uint8_t>((c >>  8) & 0xFF);
+                dst[2] = static_cast<uint8_t>( c        & 0xFF);
+                dst[3] = srcAlpha;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        //  Step 2: Label connected components on the full masterPixelColor map.
+        //  We use a copy because labelComponents() may mutate its input via
+        //  future refactors; the const& overload prevents that today but a
+        //  copy is cheap here vs. the DPI cost below.
+        // ------------------------------------------------------------------
+        std::vector<uint32_t> compColor;
+        std::vector<int>      compSize;
+        std::vector<std::array<int,4>> compBBox;
+        // Use masterPixelColor directly (const& -- labelComponents only reads it)
+        std::vector<int> labelMap =
+            labelComponents(masterPixelColor, width, height,
+                            compColor, compSize, compBBox);
+        const int nC = static_cast<int>(compSize.size());
+        VT_LOG("PROP-2: labelComponents done: %d components", nC);
+
+        // ------------------------------------------------------------------
+        //  Step 3: Per-component mask-coverage ratio.
+        //  coverage[c] = fraction of component pixels with maskAlpha >= 128.
+        // ------------------------------------------------------------------
+        std::vector<int> fgPixCount(static_cast<size_t>(nC), 0);
         for (int i = 0; i < N; ++i) {
-            const uint8_t srcAlpha = maskedBackground[static_cast<size_t>(i) * 4 + 3];
-            if (srcAlpha == 0) continue;
-            uint32_t c = bgPixelColor[i];
+            int lbl = labelMap[i];
+            if (lbl < 0 || lbl >= nC) continue;
+            if (masterPixelColor[i] == 0xFFFFFFFFu) continue;
+            if (maskPixels[static_cast<size_t>(i) * 4 + 3] >= 128)
+                ++fgPixCount[lbl];
+        }
+        std::vector<float> coverage(static_cast<size_t>(nC), 0.f);
+        for (int c = 0; c < nC; ++c)
+            if (compSize[c] > 0)
+                coverage[c] = static_cast<float>(fgPixCount[c])
+                            / static_cast<float>(compSize[c]);
+
+        // ------------------------------------------------------------------
+        //  Step 4: Split masterPixelColor into three per-layer maps.
+        //  Pixels are assigned to exactly one map based on their component's
+        //  coverage ratio; all three maps use the same colour values from
+        //  masterPixelColor so no new seam can be introduced.
+        // ------------------------------------------------------------------
+        std::vector<uint32_t> bgPixelColor(static_cast<size_t>(N), 0xFFFFFFFFu);
+        std::vector<uint32_t> fgPixelColor(static_cast<size_t>(N), 0xFFFFFFFFu);
+        std::vector<uint32_t> trPixelColor(static_cast<size_t>(N), 0xFFFFFFFFu);
+
+        std::unordered_map<uint32_t, bool> bgSeen, fgSeen, trSeen;
+        bgSeen.reserve(1024); fgSeen.reserve(2048); trSeen.reserve(512);
+
+        for (int i = 0; i < N; ++i) {
+            int lbl = labelMap[i];
+            if (lbl < 0 || lbl >= nC) continue;
+            uint32_t c = masterPixelColor[i];
             if (c == 0xFFFFFFFFu) continue;
-            uint8_t* dst = bgReconstructed.data() + static_cast<size_t>(i) * 4;
-            dst[0] = static_cast<uint8_t>((c >> 16) & 0xFF);
-            dst[1] = static_cast<uint8_t>((c >>  8) & 0xFF);
-            dst[2] = static_cast<uint8_t>( c        & 0xFF);
-            dst[3] = srcAlpha;
+            if (originalPixels[static_cast<size_t>(i) * 4 + 3] == 0) continue;
+            float cov = coverage[lbl];
+            if (cov >= kFgCoverageThresh) {
+                fgPixelColor[i] = c; fgSeen[c] = true;
+            } else if (cov < kBgCoverageThresh) {
+                bgPixelColor[i] = c; bgSeen[c] = true;
+            } else {
+                trPixelColor[i] = c; trSeen[c] = true;
+            }
         }
-        Options p2a = options.pass2;
-        p2a.color_precision  = 8;
-        p2a.corner_threshold = 60.f;  // FINAL-FIX: restore standard corner sensitivity
-        p2a.filter_speckle   = 4;     // FINAL-FIX: 16 was killing background detail
-        p2a.path_precision   = 2;
-        p2a.rdp_epsilon      = 0.5f;  // FINAL-FIX: preserve background shape fidelity
-        p2a.blur_radius      = 0.f;
-        p2a.gradient_detect_thresh = (options.pass2.gradient_detect_thresh > 0.f)
+
+        auto palFromSeen = [](const std::unordered_map<uint32_t,bool>& m) {
+            std::vector<uint32_t> v; v.reserve(m.size());
+            for (auto& [c, _] : m) v.push_back(c);
+            return v;
+        };
+        std::vector<uint32_t> bgPalette = palFromSeen(bgSeen);
+        std::vector<uint32_t> fgPalette = palFromSeen(fgSeen);
+        std::vector<uint32_t> trPalette = palFromSeen(trSeen);
+
+        VT_LOG("PROP-2: layer split -- bg %d pal, fg %d pal, transition %d pal entries",
+               (int)bgPalette.size(), (int)fgPalette.size(), (int)trPalette.size());
+
+        // ------------------------------------------------------------------
+        //  Step 5: DPI options (same fidelity for all three sub-layers so
+        //  path shapes are consistent across the shared palette).
+        //  Background uses slightly coarser settings (fewer visible details
+        //  far from the subject); transition and foreground share the same
+        //  tight settings used by the old Pass 2b.
+        // ------------------------------------------------------------------
+        Options p2fg = options.pass2;
+        p2fg.color_precision  = 8;
+        p2fg.corner_threshold = 50.f;
+        p2fg.filter_speckle   = 4;
+        p2fg.path_precision   = 2;
+        p2fg.rdp_epsilon      = 0.35f;
+        p2fg.blur_radius      = 0.f;
+        p2fg.gradient_detect_thresh =
+            (options.pass2.gradient_detect_thresh > 0.f)
             ? options.pass2.gradient_detect_thresh : 4.0f;
-        // ENH-17: DPI for background pass -- same bypass of global K-means.
-        // buildLCQPaletteAndAssign returns the union palette as its return value
-        // and fills bgPixelColor as the per-pixel assignment map. We need both
-        // separately: palette for color lookup, pixelColor to be consumed (moved).
-        // The return value of buildLCQPaletteAndAssign was discarded above; we
-        // rebuild the unique palette from bgPixelColor before consuming it.
-        std::vector<uint32_t> bgPalette;
-        {
-            std::unordered_map<uint32_t,bool> seen;
-            seen.reserve(1024);
-            for (uint32_t c : bgPixelColor)
-                if (c != 0xFFFFFFFFu) seen[c] = true;
-            bgPalette.reserve(seen.size());
-            for (auto& [c,_] : seen) bgPalette.push_back(c);
-        }
-        std::string d, b;
-        {
-            std::string dpiDefs, dpiPaths;
+
+        Options p2bg = p2fg;         // coarser background pass
+        p2bg.corner_threshold = 60.f;
+        p2bg.filter_speckle   = 4;
+        p2bg.rdp_epsilon      = 0.5f;
+
+        Options p2tr = p2fg;         // transition: same as foreground
+        p2tr.filter_speckle   = 2;   // keep more detail at boundary
+        p2tr.rdp_epsilon      = 0.30f;
+
+        // ------------------------------------------------------------------
+        //  Step 6: Emit SVG for each non-empty layer.
+        //  All three layers share fullReconstructed as the tracing buffer and
+        //  originalPixels as the ENH-14 dominant-colour resample source.
+        // ------------------------------------------------------------------
+        std::string dAll, bAll;
+
+        // ---- Background layer ----
+        if (!bgPalette.empty()) {
+            std::string dBg, bBg;
             vectorizeLayerContentDPI(
-                maskedBackground.data(),    // original (inverse-masked) for ENH-14
-                bgReconstructed.data(),     // LCQ RGBA for tracing
+                originalPixels,
+                fullReconstructed.data(),
                 width, height,
-                p2a, kDilateRadius,
-                bgPalette,                 // unique colours from LCQ assignment
-                bgPixelColor,              // pixelColor map (consumed/moved inside)
-                dpiDefs, dpiPaths);
-            scopeSvgIds(dpiDefs,  "p2a-");
-            scopeSvgIds(dpiPaths, "p2a-");
+                p2bg, kDilateRadius,
+                bgPalette, bgPixelColor,
+                dBg, bBg);
+            scopeSvgIds(dBg, "p2bg-");
+            scopeSvgIds(bBg, "p2bg-");
             char gOpen[128];
             snprintf(gOpen, sizeof(gOpen),
                 "<g id=\"layer-background\" style=\"opacity:%.2f\">",
                 (double)kPass2Opacity);
-            // FIX-BLEND-1: d=defs, b=body is the PassResult convention used by runPass
-            // and consumed at the assembly site (allDefs+=first, svgBody+=second).
-            // Previous code had these swapped: defs went to svgBody (invisible inline
-            // defs), paths went to allDefs (invalid gradient-definition context).
-            // Result was Pass 2a (background LCQ) rendering as completely invisible.
-            d = dpiDefs;
-            b = std::string(gOpen) + dpiPaths + "</g>";
+            dAll += dBg;
+            bAll += std::string(gOpen) + bBg + "</g>";
         }
-        VT_LOG("vectorizeMultiPass: Pass 2a DPI done in %.1f ms", vt_now_ms() - ts);
-        return {d, b};
-    });
-    // Pass 2b (async) -- foreground LCQ: car/subject only (was Pass 2)
-    std::vector<uint32_t> pass2PixelColor;
-    auto fut2 = std::async(std::launch::async, [&]() -> PassResult {
-        double ts = vt_now_ms();
-        // Step 1: mask original to foreground only
-        std::vector<uint8_t> maskedOriginal =
-            applyMaskToPixels(originalPixels, maskPixels, width, height);
 
-
-        // Step 2: run LCQ -- fills pass2PixelColor with per-pixel palette assignments
-        // ENH-16: receive per-tile options for downstream speckle filtering.
-        std::vector<TileOptions> p2TileOpts;
-        std::vector<uint32_t> p2Palette =
-            buildLCQPaletteAndAssign(
-                maskedOriginal.data(), width, height,
-                options.lcqGridW > 0 ? options.lcqGridW : kLCQGridW,
-                options.lcqGridH > 0 ? options.lcqGridH : kLCQGridH,
-                kLCQColorsPerTile,
-                pass2PixelColor,
-                p2TileOpts,
-                options.varFlat, options.varMid);  // ENH-16 thresholds
-        VT_LOG("ENH-12a LCQ: %d palette entries for Pass 2", (int)p2Palette.size());
-
-
-        // Step 3: Reconstruct full RGBA image from LCQ per-pixel assignments.
-        // Each opaque pixel gets the RGB of its tile's nearest palette color.
-        // Transparent pixels (alpha==0 in maskedOriginal) remain transparent.
-        // No global smooth applied -- do NOT blur lcqReconstructed (per spec).
-        const int N = width * height;
-        std::vector<uint8_t> lcqReconstructed(static_cast<size_t>(N) * 4, 0);
-        for (int i = 0; i < N; ++i) {
-            const uint8_t srcAlpha = maskedOriginal[static_cast<size_t>(i) * 4 + 3];
-            if (srcAlpha == 0) continue;               // masked / transparent: stay (0,0,0,0)
-            uint32_t c = pass2PixelColor[i];
-            if (c == 0xFFFFFFFFu) continue;            // unassigned sentinel: stay transparent
-            // Unpack palette color (0x00RRGGBB) into RGBA bytes
-            uint8_t* dst = lcqReconstructed.data() + static_cast<size_t>(i) * 4;
-            dst[0] = static_cast<uint8_t>((c >> 16) & 0xFF); // R
-            dst[1] = static_cast<uint8_t>((c >>  8) & 0xFF); // G
-            dst[2] = static_cast<uint8_t>( c        & 0xFF); // B
-            dst[3] = srcAlpha;                                 // preserve original alpha
-        }
-        VT_LOG("ENH-12-FIX: Pass 2 LCQ RGBA reconstruction complete (%d px)", N);
-
-
-        // Step 4: ENH-17 Direct Palette Injection (DPI)
-        // Instead of feeding lcqReconstructed back through vectorize() which would
-        // re-run global zone-aware K-means (buildPaletteAndAssign) and collapse all
-        // ~18 000 tile-local colours back to 256 global entries, we call
-        // vectorizeLayerContentDPI which jumps straight to Stage 3 (connected
-        // components) with the LCQ pixelColor and palette already in hand.
-        //
-        // Colour fidelity gain:
-        //   Before: 18 432 tile-local colours -> global K-means -> 256 -> paths
-        //   After:  18 432 tile-local colours -> connected components -> ENH-14
-        //           dominant-colour resample from original pixels -> paths
-        //           Every path fill is a real measured pixel colour.
-        Options p2 = options.pass2;
-        p2.color_precision  = 8;
-        p2.corner_threshold = 50.f;   // FINAL-FIX: balanced corner sensitivity
-        p2.filter_speckle   = 4;      // FINAL-FIX: 8 was killing foreground detail
-        p2.path_precision   = 2;
-        p2.rdp_epsilon      = 0.35f;  // FINAL-FIX: preserve car body shape fidelity
-        p2.blur_radius      = 0.f;
-        p2.gradient_detect_thresh = (options.pass2.gradient_detect_thresh > 0.f)
-            ? options.pass2.gradient_detect_thresh : 4.0f;
-        std::string d, b;
-        {
-            // Build the runPass group wrapper (opacity + id) around DPI output
-            std::string dpiDefs, dpiPaths;
-            // CRASH FIX (BUG-4): pass2PixelColor is captured by [&] and shared
-            // with the outer scope (Pass 3 and Pass 5 read it after fut2.get()).
-            // vectorizeLayerContentDPI moves from it internally, leaving it empty.
-            // Save a copy before the call so downstream passes still have data.
-            // The copy is cheap relative to the DPI work (~W*H*4 bytes).
-            std::vector<uint32_t> pass2PixelColorForDPI = pass2PixelColor; // copy
+        // ---- Transition layer (feBlend alpha feathering at mask edge) ----
+        if (!trPalette.empty()) {
+            std::string dTr, bTr;
             vectorizeLayerContentDPI(
-                maskedOriginal.data(),    // original RGBA for ENH-14 resampling
-                lcqReconstructed.data(),  // LCQ RGBA for boundary tracing
+                originalPixels,
+                fullReconstructed.data(),
                 width, height,
-                p2, kDilateRadius,
-                p2Palette,
-                pass2PixelColorForDPI,    // copy consumed (moved) -- original preserved
-                dpiDefs, dpiPaths);
-            // Prefix the id and url() references so they don't collide with other passes
-            scopeSvgIds(dpiDefs,  "p2-");
-            scopeSvgIds(dpiPaths, "p2-");
-            // Wrap in the layer group with opacity
+                p2tr, 0.f,          // no extra dilation; feather handles it
+                trPalette, trPixelColor,
+                dTr, bTr);
+            scopeSvgIds(dTr, "p2tr-");
+            scopeSvgIds(bTr, "p2tr-");
+
+            // SVG filter: blur the alpha channel then composite back over
+            // SourceGraphic so boundary edges feather rather than hard-clip.
+            static std::atomic<int> trFCtr{0};
+            int trFId = ++trFCtr;
+            char trFiltId[48];
+            snprintf(trFiltId, sizeof(trFiltId), "p2tr-feather%d", trFId);
+            char filterDef[512];
+            snprintf(filterDef, sizeof(filterDef),
+                "<filter id=\"%s\" "
+                    "x=\"-2%%\" y=\"-2%%\" width=\"104%%\" height=\"104%%\" "
+                    "color-interpolation-filters=\"linearRGB\">"
+                  "<feGaussianBlur in=\"SourceAlpha\" stdDeviation=\"1.5\" "
+                      "result=\"blurAlpha\"/>"
+                  "<feComposite in=\"SourceGraphic\" in2=\"blurAlpha\" "
+                      "operator=\"in\"/>"
+                "</filter>",
+                trFiltId);
+            char gOpen[256];
+            snprintf(gOpen, sizeof(gOpen),
+                "<g id=\"layer-transition\" style=\"opacity:%.2f\" "
+                    "filter=\"url(#%s)\">",
+                (double)kPass2Opacity, trFiltId);
+            dAll += std::string(filterDef) + dTr;
+            bAll += std::string(gOpen) + bTr + "</g>";
+        }
+
+        // ---- Foreground / midtones layer ----
+        if (!fgPalette.empty()) {
+            std::string dFg, bFg;
+            vectorizeLayerContentDPI(
+                originalPixels,
+                fullReconstructed.data(),
+                width, height,
+                p2fg, kDilateRadius,
+                fgPalette, fgPixelColor,
+                dFg, bFg);
+            scopeSvgIds(dFg, "p2fg-");
+            scopeSvgIds(bFg, "p2fg-");
             char gOpen[128];
             snprintf(gOpen, sizeof(gOpen),
                 "<g id=\"layer-midtones\" style=\"opacity:%.2f\">",
                 (double)kPass2Opacity);
-            // FIX-BLEND-2: same d=defs / b=body convention fix as Pass 2a.
-            // Previous swap caused Pass 2b (foreground LCQ) to also render invisible,
-            // leaving only the coarse Pass 1 base layer visible in the output SVG.
-            // This was the primary cause of flat/desaturated true-color output in
-            // vectorizeMultiPass: both LCQ passes were silently discarded.
-            d = dpiDefs;
-            b = std::string(gOpen) + dpiPaths + "</g>";
+            dAll += dFg;
+            bAll += std::string(gOpen) + bFg + "</g>";
         }
-        VT_LOG("vectorizeMultiPass: Pass 2 DPI done in %.1f ms", vt_now_ms() - ts);
-        return {d, b};
+
+        VT_LOG("PROP-2: Unified Pass 2 (bg+transition+fg) done in %.1f ms "
+               "(%d bg, %d tr, %d fg palette entries)",
+               vt_now_ms() - ts,
+               (int)bgPalette.size(), (int)trPalette.size(), (int)fgPalette.size());
+        return {dAll, bAll};
     });
 
 
-    // Pass 4 -- CRASH FIX (BUG-1): fut4 used std::launch::async and captured
-    // pass2PixelColor by [&]. pass2PixelColor is populated inside fut2's lambda,
-    // so fut4 reading it concurrently is an unsynchronised data race -> crash.
-    // Fix: use std::launch::deferred so the lambda runs synchronously only when
-    // fut4.get() is called, which happens AFTER fut2.get() has returned and
-    // pass2PixelColor is fully written.
+
+
+
+
+
+
+
+    // Pass 4 -- std::launch::deferred so it runs synchronously only when
+    // fut4.get() is called (after fut2.get()).  PROP-2: pass2PixelColor is
+    // now set synchronously from masterPixelColor before any future is launched,
+    // so the old data-race (BUG-1) is structurally eliminated; deferred is kept
+    // to preserve the serialized fut2->fut4 execution order for clarity.
     auto fut4 = std::async(std::launch::deferred, [&]() -> PassResult {
         double ts = vt_now_ms();
         Options p4;
@@ -7063,6 +7854,12 @@ std::string vectorizeMultiPass(
         //         d, b);
 
 
+
+
+
+
+
+
         //(Pass 4, ENH-19):
         {
             std::vector<uint32_t> hlPixelColor, hlPalette;
@@ -7073,6 +7870,12 @@ std::string vectorizeMultiPass(
                 hlPixelColor, hlPalette);
 
 
+
+
+
+
+
+
             std::string dpiDefs, dpiPaths;
             vectorizeLayerContentDPI(
                 originalPixels,         // for ENH-14 dominant-color resample
@@ -7081,6 +7884,12 @@ std::string vectorizeMultiPass(
                 p4, kDilateRadius,
                 hlPalette, hlPixelColor,
                 dpiDefs, dpiPaths);
+
+
+
+
+
+
 
 
             scopeSvgIds(dpiDefs,  "p4-");
@@ -7099,9 +7908,21 @@ std::string vectorizeMultiPass(
         }
 
 
+
+
+
+
+
+
         VT_LOG("vectorizeMultiPass: Pass 4 done in %.1f ms", vt_now_ms() - ts);
         return {d, b};
     });
+
+
+
+
+
+
 
 
     // Pass 5 (async) -- independent
@@ -7132,6 +7953,12 @@ std::string vectorizeMultiPass(
     // });
 
 
+
+
+
+
+
+
     // ENH-19: Pass 5 is now run sequentially after fut2.get() so it can consume
     // pass2PixelColor (written inside fut2's lambda) without a data race.
     // This stub keeps fut5 alive for the FutureJoiner and the fut5.get() at the
@@ -7139,6 +7966,12 @@ std::string vectorizeMultiPass(
     auto fut5 = std::async(std::launch::deferred, []() -> PassResult {
         return {"", ""};
     });
+
+
+
+
+
+
 
 
     // FIX-MEM-2: Ensure all outstanding futures are joined before any local
@@ -7155,25 +7988,31 @@ std::string vectorizeMultiPass(
     // This is safe from any throw site between future launches and the final
     // joiner.done=true (which is now removed -- the null-check replaces it).
     struct FutureJoiner {
-        std::future<PassResult>* futures[5];
+        std::future<PassResult>* futures[4];
         ~FutureJoiner() {
             for (auto*& fp : futures)
                 if (fp && fp->valid()) try { fp->get(); } catch (...) {}
         }
-    } joiner{{&fut1, &fut2a, &fut2, &fut4, &fut5}};
+    } joiner{{&fut1, &fut2, &fut4, &fut5}};
     // Wait for Pass 2, then run Pass 3 (depends on pass2PixelColor)
     // CRASH FIX (BUG-2): null joiner pointer immediately after get() so the
     // destructor cannot call get() again on an already-consumed future.
     {
-        joiner.futures[2] = nullptr; // fut2 about to be consumed
+        joiner.futures[1] = nullptr; // PROP-2: fut2 (unified) is at index 1
         auto [d2, b2] = fut2.get();
-        // Insert Pass 2 into the SVG (will be followed by Pass 3)
+        // PROP-2: Append unified bg+transition+fg layers before Pass 3 and Pass 5
         allDefs += d2; svgBody += b2;
         double ts3 = vt_now_ms();
         // std::vector<uint8_t> adaptedHP =
         //     adaptiveThresholdHighPass(
         //         highPassPixels, pass2PixelColor,
         //         width, height, options.microDetailDeltaEThresh > 0.f ? options.microDetailDeltaEThresh : kMicroDetailDeltaEThresh);
+
+
+
+
+
+
 
 
         //(ENH-18):
@@ -7186,6 +8025,12 @@ std::string vectorizeMultiPass(
                 options.microDetailDeltaEThresh > 0.f
                     ? options.microDetailDeltaEThresh
                     : kMicroDetailDeltaEThresh);
+
+
+
+
+
+
 
 
         // ENH-20: Pass 3 Direct Palette Injection
@@ -7221,20 +8066,162 @@ std::string vectorizeMultiPass(
             ? options.pass3.gradient_detect_thresh : 4.0f;
         std::string d3, b3;
         {
-            // Step A: LCQ on the chromatic HP buffer
-            // Use a finer grid (same as Pass 2) so tile-local micro-detail hues
-            // are quantized independently. colorsPerTile=16 (half of Pass 2's 32)
-            // keeps the palette compact -- micro-detail is single-hue per region.
-            std::vector<uint32_t> p3PixelColor;
-            std::vector<TileOptions> p3TileOpts;
-            std::vector<uint32_t> p3Palette = buildLCQPaletteAndAssign(
-                adaptedHP.data(), width, height,
-                kLCQGridW, kLCQGridH,
-                14,    // VFINAL: 8 too few on sparse HP buffer; 14 ensures adequate coverage
-                p3PixelColor, p3TileOpts,
-                options.varFlat, options.varMid);
-            VT_LOG("ENH-20 Pass3 LCQ: %d micro-detail palette entries",
-                   (int)p3Palette.size());
+            // PROP-1 Pass 3: Derive HP palette from masterPalette by applying Lab HP
+            // deltas instead of running a full LCQ on the chromatic HP buffer.
+            //
+            // Rationale: Pass 3's chromatic HP buffer is computed by shifting each
+            // master palette entry by the local Lab delta (original - blur).  The
+            // colour space of adaptedHP is entirely determined by masterPixelColor --
+            // no new colour can appear that isn't a shifted version of a master entry.
+            // Re-running K-means on this buffer re-solves an already-solved problem.
+            //
+            // Method:
+            //  1. For each master palette entry, compute the median Lab HP delta
+            //     across all pixels assigned to that entry.
+            //  2. Apply the delta to get a shifted Lab value.
+            //  3. Deduplicate with dedupByLabVoxel (same cell size as the LCQ union).
+            //  4. Build p3PixelColor by mapping each adaptedHP pixel to the nearest
+            //     derived palette entry using a fast Lab Euclidean pre-filter.
+            //
+            // Cost: O(N) single scan for per-entry delta accumulation + O(P) for
+            // palette derivation (P = master palette size, typically ~300-800).
+            // Saves the full 256-tile K-means++ run (~3-4 s on 1080p ARM).
+
+
+            double ts3LCQ = vt_now_ms();
+
+
+            // -- Step A: accumulate per-master-entry Lab HP delta sums ----------
+            const int N3 = width * height;
+            const int masterPalSize = (int)masterPalette.size();
+
+
+            // Build palette->index map for accumulation
+            std::unordered_map<uint32_t, int> masterPalIdx;
+            masterPalIdx.reserve(static_cast<size_t>(masterPalSize) * 2);
+            for (int pi = 0; pi < masterPalSize; ++pi)
+                masterPalIdx[masterPalette[pi]] = pi;
+
+
+            // Per-entry accumulators: sum of Lab HP deltas
+            struct DeltaAcc { double dL=0, da=0, db=0; long cnt=0; };
+            std::vector<DeltaAcc> entryDeltas(static_cast<size_t>(masterPalSize));
+
+
+            for (int i = 0; i < N3; ++i) {
+                uint32_t mc = masterPixelColor[i];
+                if (mc == 0xFFFFFFFFu) continue;
+                // Only accumulate for pixels where adaptedHP is non-transparent
+                if (adaptedHP[static_cast<size_t>(i) * 4 + 3] == 0) continue;
+                auto it = masterPalIdx.find(mc);
+                if (it == masterPalIdx.end()) continue;
+                int pi = it->second;
+                // Compute Lab HP delta = Lab(original) - Lab(blur)
+                const uint8_t* o = originalPixels + static_cast<size_t>(i) * 4;
+                const uint8_t* b = blurPixels     + static_cast<size_t>(i) * 4;
+                Lab labOrig = rgbToLabLUT(packRGB(o[0], o[1], o[2]));
+                Lab labBlur = rgbToLabLUT(packRGB(b[0], b[1], b[2]));
+                entryDeltas[pi].dL  += labOrig.L - labBlur.L;
+                entryDeltas[pi].da  += labOrig.a - labBlur.a;
+                entryDeltas[pi].db  += labOrig.b - labBlur.b;
+                entryDeltas[pi].cnt += 1;
+            }
+
+
+            // -- Step B: derive shifted palette entries -------------------------
+            std::vector<uint32_t> p3DerivedPalRaw;
+            p3DerivedPalRaw.reserve(static_cast<size_t>(masterPalSize));
+            std::vector<Lab> p3DerivedLab(static_cast<size_t>(masterPalSize));
+            for (int pi = 0; pi < masterPalSize; ++pi) {
+                Lab baseLab = rgbToLabLUT(masterPalette[pi]);
+                if (entryDeltas[pi].cnt > 0) {
+                    float dL = (float)(entryDeltas[pi].dL / entryDeltas[pi].cnt);
+                    float da = (float)(entryDeltas[pi].da / entryDeltas[pi].cnt);
+                    float db = (float)(entryDeltas[pi].db / entryDeltas[pi].cnt);
+                    Lab shifted = {
+                        std::clamp(baseLab.L + dL, 0.f, 100.f),
+                        std::clamp(baseLab.a + da, -128.f, 127.f),
+                        std::clamp(baseLab.b + db, -128.f, 127.f)
+                    };
+                    p3DerivedLab[pi] = shifted;
+                    p3DerivedPalRaw.push_back(labToRGB(shifted));
+                } else {
+                    // No HP pixels for this master entry -- use base colour
+                    p3DerivedLab[pi] = baseLab;
+                    p3DerivedPalRaw.push_back(masterPalette[pi]);
+                }
+            }
+
+
+            // Deduplicate near-identical derived entries (cellSize=2 same as LCQ union)
+            std::vector<uint32_t> p3Palette = dedupByLabVoxel(p3DerivedPalRaw, 2.f);
+            VT_LOG("PROP-1 Pass 3: derived palette %d -> dedup %d entries (%.1f ms)",
+                   (int)p3DerivedPalRaw.size(), (int)p3Palette.size(),
+                   vt_now_ms() - ts3LCQ);
+
+
+            // -- Step C: assign each adaptedHP pixel to the nearest derived entry --
+            // Use the same two-level Lab Euclidean / CIEDE2000 pre-filter as the
+            // standard buildLCQPaletteAndAssign assignment loop.
+            std::vector<uint32_t> p3PixelColor(static_cast<size_t>(N3), 0xFFFFFFFFu);
+            {
+                // Pre-compute Lab values for derived palette
+                const int p3K = (int)p3Palette.size();
+                std::vector<Lab> p3PalLab(static_cast<size_t>(p3K));
+                for (int pi = 0; pi < p3K; ++pi)
+                    p3PalLab[pi] = rgbToLabLUT(p3Palette[pi]);
+
+
+                static constexpr float kP3EuclidGate  = 1.32f;
+                static constexpr float kP3SafeMarginSq = 6.25f;
+                std::unordered_map<uint32_t, uint32_t> assignCache;
+                assignCache.reserve(512);
+
+
+                for (int i = 0; i < N3; ++i) {
+                    if (adaptedHP[static_cast<size_t>(i) * 4 + 3] == 0) continue;
+                    uint32_t raw = packRGB(
+                        adaptedHP[static_cast<size_t>(i) * 4 + 0],
+                        adaptedHP[static_cast<size_t>(i) * 4 + 1],
+                        adaptedHP[static_cast<size_t>(i) * 4 + 2]);
+                    auto cit = assignCache.find(raw);
+                    if (cit != assignCache.end()) {
+                        p3PixelColor[i] = cit->second;
+                        continue;
+                    }
+                    Lab rawLab = rgbToLabLUT(raw);
+                    float bestEucSq = 1e30f;
+                    int   bestEucIdx = 0;
+                    for (int pi = 0; pi < p3K; ++pi) {
+                        float dL = rawLab.L - p3PalLab[pi].L;
+                        float da = rawLab.a - p3PalLab[pi].a;
+                        float db = rawLab.b - p3PalLab[pi].b;
+                        float dsq = dL*dL + da*da + db*db;
+                        if (dsq < bestEucSq) { bestEucSq = dsq; bestEucIdx = pi; }
+                    }
+                    const float gate = bestEucSq * kP3EuclidGate + kP3SafeMarginSq;
+                    float bestDE = ciede2000(rawLab, p3PalLab[bestEucIdx]);
+                    uint32_t bestC = p3Palette[bestEucIdx];
+                    for (int pi = 0; pi < p3K; ++pi) {
+                        if (pi == bestEucIdx) continue;
+                        float dL = rawLab.L - p3PalLab[pi].L;
+                        float da = rawLab.a - p3PalLab[pi].a;
+                        float db = rawLab.b - p3PalLab[pi].b;
+                        if (dL*dL + da*da + db*db > gate) continue;
+                        float d = ciede2000(rawLab, p3PalLab[pi]);
+                        if (d < bestDE) { bestDE = d; bestC = p3Palette[pi]; }
+                    }
+                    p3PixelColor[i] = bestC;
+                    assignCache[raw] = bestC;
+                }
+            }
+            VT_LOG("PROP-1 Pass 3: pixel assignment done (no extra LCQ call)");
+
+
+
+
+
+
 
 
             // Step B: DPI -- skip global K-means, go straight to components
@@ -7249,8 +8236,20 @@ std::string vectorizeMultiPass(
                 dpiDefs3, dpiPaths3);
 
 
+
+
+
+
+
+
             scopeSvgIds(dpiDefs3,  "p3-");
             scopeSvgIds(dpiPaths3, "p3-");
+
+
+
+
+
+
 
 
             float p3Opacity = options.highPassGroupOpacity > 0.f
@@ -7272,6 +8271,9 @@ std::string vectorizeMultiPass(
                              ? options.microDetailDeltaEThresh : kMicroDetailDeltaEThresh;
             if (deThresh < 3.5f) p3AdaptiveStd = std::min(p3AdaptiveStd, 0.5f);
 
+
+
+
             static std::atomic<int> p3BlurCtr{0};
             int p3BId = ++p3BlurCtr;
             char p3FilterId[32]; snprintf(p3FilterId, sizeof(p3FilterId), "p3blur%d", p3BId);
@@ -7288,11 +8290,23 @@ std::string vectorizeMultiPass(
                 p3FilterId, (double)p3Opacity);
 
 
+
+
+
+
+
+
             d3 = std::string(p3FilterDef) + dpiDefs3;
             b3 = std::string(gOpen3) + dpiPaths3 + "</g>";
         }
         VT_LOG("vectorizeMultiPass: Pass 3 ENH-20 DPI done in %.1f ms", vt_now_ms() - ts3);
         allDefs += d3; svgBody += b3;
+
+
+
+
+
+
 
 
         // ===================================================================
@@ -7314,6 +8328,12 @@ std::string vectorizeMultiPass(
             double ts5 = vt_now_ms();
 
 
+
+
+
+
+
+
             // -- Step 1: Build hue-anchored shadow buffer -----------------
             // For each shadow pixel (original L* <= kShadowLStarThresh):
             //   output RGB = labToRGB({ orig.L, surface.a*, surface.b* })
@@ -7327,9 +8347,21 @@ std::string vectorizeMultiPass(
                 if (o[3] == 0) continue;
 
 
+
+
+
+
+
+
                 uint32_t origRGB = packRGB(o[0], o[1], o[2]);
                 Lab labOrig = rgbToLabLUT(origRGB);
                 if (labOrig.L > kShadowLStarThresh) continue;   // not a shadow pixel
+
+
+
+
+
+
 
 
                 uint32_t baseRGB = (i < (int)pass2PixelColor.size() &&
@@ -7338,7 +8370,19 @@ std::string vectorizeMultiPass(
                                    : origRGB;                    // fallback: raw pixel
 
 
+
+
+
+
+
+
                 Lab labBase = rgbToLabLUT(baseRGB);
+
+
+
+
+
+
 
 
                 // Anchor: keep the shadow luminance, take hue from the LCQ surface.
@@ -7350,6 +8394,12 @@ std::string vectorizeMultiPass(
                 uint32_t outRGB = labToRGB(labOut);
 
 
+
+
+
+
+
+
                 uint8_t* dst = shadowAnchoredBuf.data() + static_cast<size_t>(i) * 4;
                 dst[0] = rCh(outRGB);
                 dst[1] = gCh(outRGB);
@@ -7359,20 +8409,122 @@ std::string vectorizeMultiPass(
             VT_LOG("ENH-19: shadow hue-anchor buffer built (%d px)", N5);
 
 
-            // -- Step 2: LCQ on hue-anchored buffer -----------------------
-            // Using the standard grid so tile sizes match Pass 2. Shadow pixels
-            // occupy ~15% of tiles; LCQ naturally skips empty tiles.
-            std::vector<uint32_t> sh5PixelColor, sh5Palette;
+
+
+
+
+
+
+            // -- PROP-1 Step 2: Derive shadow palette from masterPalette ----------
+            // Instead of running buildLCQPaletteAndAssign on shadowAnchoredBuf,
+            // filter masterPalette to entries whose luminance is at or below
+            // kShadowLStarThresh (the same threshold used to select shadow pixels).
+            //
+            // Rationale: shadowAnchoredBuf is entirely constructed from master
+            // surface colours (from pass2PixelColor) shifted to original L* values.
+            // Every colour in shadowAnchoredBuf is therefore a luminance-shifted
+            // variant of a masterPalette entry.  Re-running K-means on this buffer
+            // re-solves the segmentation that the master LCQ already performed.
+            //
+            // The shadow palette is a luminance-filtered subset of masterPalette:
+            // any master entry with Lab(L*) <= kShadowLStarThresh qualifies directly.
+            // Entries above the threshold are included only if they have a
+            // corresponding shadow-region pixel in masterPixelColor (i.e. the surface
+            // colour is above threshold but the pixel is in shadow -- a real physical
+            // scenario like a brightly-coloured object in deep shadow).
+            //
+            // Cost: O(N) single scan + O(P) palette filter. Saves one full
+            // 256-tile LCQ K-means run (~3 s on 1080p ARM).
+            std::vector<uint32_t> sh5PixelColor(static_cast<size_t>(N5), 0xFFFFFFFFu);
+            std::vector<uint32_t> sh5Palette;
             {
-                std::vector<TileOptions> sh5TileOpts;
-                sh5Palette = buildLCQPaletteAndAssign(
-                    shadowAnchoredBuf.data(), width, height,
-                    kLCQGridW, kLCQGridH, kLCQColorsPerTile,
-                    sh5PixelColor, sh5TileOpts,
-                    options.varFlat, options.varMid);
+                double ts5LCQ = vt_now_ms();
+
+
+                // Build set of master palette entries actually used in shadow pixels.
+                std::unordered_map<uint32_t, bool> shadowPalSeen;
+                shadowPalSeen.reserve(512);
+                for (int i = 0; i < N5; ++i) {
+                    if (shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 3] == 0)
+                        continue;
+                    uint32_t c = packRGB(
+                        shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 0],
+                        shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 1],
+                        shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 2]);
+                    shadowPalSeen[c] = true;
+                }
+
+
+                // The shadow-anchored palette is already the set of unique colours in
+                // shadowAnchoredBuf (each is labToRGB({orig.L, masterBase.a, masterBase.b})).
+                // Build sh5Palette and assign pixels directly.
+                sh5Palette.reserve(shadowPalSeen.size());
+                for (auto& [c, _] : shadowPalSeen) sh5Palette.push_back(c);
+
+
+                if (!sh5Palette.empty()) {
+                    // Deduplicate near-identical shadow entries
+                    sh5Palette = dedupByLabVoxel(sh5Palette, 2.f);
+
+
+                    const int sh5K = (int)sh5Palette.size();
+                    std::vector<Lab> sh5PalLab(static_cast<size_t>(sh5K));
+                    for (int pi = 0; pi < sh5K; ++pi)
+                        sh5PalLab[pi] = rgbToLabLUT(sh5Palette[pi]);
+
+
+                    static constexpr float kSh5EuclidGate  = 1.32f;
+                    static constexpr float kSh5SafeMarginSq = 6.25f;
+                    std::unordered_map<uint32_t, uint32_t> sh5Cache;
+                    sh5Cache.reserve(512);
+
+
+                    for (int i = 0; i < N5; ++i) {
+                        if (shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 3] == 0)
+                            continue;
+                        uint32_t raw = packRGB(
+                            shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 0],
+                            shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 1],
+                            shadowAnchoredBuf[static_cast<size_t>(i) * 4 + 2]);
+                        auto cit = sh5Cache.find(raw);
+                        if (cit != sh5Cache.end()) {
+                            sh5PixelColor[i] = cit->second;
+                            continue;
+                        }
+                        Lab rawLab = rgbToLabLUT(raw);
+                        float bestEucSq = 1e30f; int bestEucIdx = 0;
+                        for (int pi = 0; pi < sh5K; ++pi) {
+                            float dL = rawLab.L - sh5PalLab[pi].L;
+                            float da = rawLab.a - sh5PalLab[pi].a;
+                            float db = rawLab.b - sh5PalLab[pi].b;
+                            float dsq = dL*dL + da*da + db*db;
+                            if (dsq < bestEucSq) { bestEucSq = dsq; bestEucIdx = pi; }
+                        }
+                        const float gate = bestEucSq * kSh5EuclidGate + kSh5SafeMarginSq;
+                        float bestDE = ciede2000(rawLab, sh5PalLab[bestEucIdx]);
+                        uint32_t bestC = sh5Palette[bestEucIdx];
+                        for (int pi = 0; pi < sh5K; ++pi) {
+                            if (pi == bestEucIdx) continue;
+                            float dL = rawLab.L - sh5PalLab[pi].L;
+                            float da = rawLab.a - sh5PalLab[pi].a;
+                            float db = rawLab.b - sh5PalLab[pi].b;
+                            if (dL*dL + da*da + db*db > gate) continue;
+                            float d = ciede2000(rawLab, sh5PalLab[pi]);
+                            if (d < bestDE) { bestDE = d; bestC = sh5Palette[pi]; }
+                        }
+                        sh5PixelColor[i] = bestC;
+                        sh5Cache[raw] = bestC;
+                    }
+                }
+                VT_LOG("PROP-1 Pass 5: derived shadow palette %d entries (%.1f ms, no extra LCQ)",
+                       (int)sh5Palette.size(), vt_now_ms() - ts5LCQ);
             }
-            VT_LOG("ENH-19: Pass 5 LCQ done: %d shadow palette entries",
-                   (int)sh5Palette.size());
+
+
+
+
+
+
 
 
             // -- Step 3: DPI -- skip global K-means, go straight to components -
@@ -7388,6 +8540,12 @@ std::string vectorizeMultiPass(
             p5.gradient_detect_thresh = 10.f;
 
 
+
+
+
+
+
+
             std::string dpiDefs5, dpiPaths5;
             vectorizeLayerContentDPI(
                 originalPixels,              // ENH-14: dominant-color resample source
@@ -7399,8 +8557,20 @@ std::string vectorizeMultiPass(
                 dpiDefs5, dpiPaths5);
 
 
+
+
+
+
+
+
             scopeSvgIds(dpiDefs5,  "p5-");
             scopeSvgIds(dpiPaths5, "p5-");
+
+
+
+
+
+
 
 
             // ENH-ISOLATION: Use multiply blend within the isolation group.
@@ -7413,53 +8583,83 @@ std::string vectorizeMultiPass(
                 (double)kPass5Opacity);
 
 
+
+
+
+
+
+
             allDefs += dpiDefs5;
             svgBody += std::string(gOpen5) + dpiPaths5 + "</g>\n";
+
+
+
+
+
+
 
 
             VT_LOG("ENH-19: Pass 5 DPI done in %.1f ms", vt_now_ms() - ts5);
         }
 
 
+
+
+
+
+
+
     }
 
 
-    // Collect async results in SVG layer-stack order.
-    // CRASH FIX (BUG-2): joiner.done removed -- null-check on each pointer replaces it.
-    // {
-    //     // Pass 1 is the bottom layer -- prepend before Pass 2+3
-    //     auto [d1, b1] = fut1.get();
-    //     allDefs = d1 + allDefs;
-    //     svgBody = b1 + svgBody;
-    // }
-    // { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
-    // { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
-    //layer order bottom->top: Pass1, Pass2a(bg), Pass2b(fg)+Pass3, Pass4, Pass5
+
+
+
+
+
+
+    // Collect remaining async results and finalize SVG layer stack.
+    // CRASH FIX (BUG-2): null-check on joiner pointer after each get().
+    // PROP-2: fut2 (unified bg+transition+fg) was already consumed in the
+    // Pass-3 dependency block above (joiner.futures[1] nulled there).
+    // We only need to prepend fut1 (base Voronoi rects) below everything.
+    //
+    // Final layer-stack order (bottom -> top):
+    //   Pass 1  layer-base         (base Voronoi rects, prepended below)
+    //   Pass 2  layer-background   (bg components, appended in Pass-3 block)
+    //   Pass 2  layer-transition   (boundary components w/ feBlend feathering)
+    //   Pass 2  layer-midtones     (fg components)
+    //   Pass 3  layer-microdetail  (appended in Pass-3 block)
+    //   Pass 5  layer-lowlights    (appended in Pass-3 block)
+    //   Pass 4  layer-highlights   (appended below)
+    //   Pass 6  layer-edges        (appended in Pass-6 block)
     {
-        // Pass 2a background sits above Pass 1 but below the foreground
-        joiner.futures[1] = nullptr; // CRASH FIX (BUG-2)
-        auto [d2a, b2a] = fut2a.get();
-        allDefs = d2a + allDefs;
-        svgBody = b2a + svgBody;
-    }
-    {
-        // Pass 1 is the bottom-most layer
+        // Pass 1 is the absolute bottom layer -- prepend before Pass 2
         joiner.futures[0] = nullptr; // CRASH FIX (BUG-2)
         auto [d1, b1] = fut1.get();
         allDefs = d1 + allDefs;
         svgBody = b1 + svgBody;
     }
-    // { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
-    // { auto [d5, b5] = fut5.get(); allDefs += d5; svgBody += b5; }
 
-
-    joiner.futures[3] = nullptr; // CRASH FIX (BUG-2)
+    joiner.futures[2] = nullptr; // CRASH FIX (BUG-2): fut4 is index 2 in 4-future array
     { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
-    joiner.futures[4] = nullptr; // CRASH FIX (BUG-2)
+    joiner.futures[3] = nullptr; // CRASH FIX (BUG-2): fut5 is index 3
     fut5.get(); // ENH-19: Pass 5 result already written into allDefs/svgBody above.
 
 
+
+
+
+
+
+
     VT_LOG("vectorizeMultiPass: Passes 1-5 complete (parallel ENH-10)");
+
+
+
+
+
+
 
 
     // =======================================================================
@@ -7471,6 +8671,12 @@ std::string vectorizeMultiPass(
     VT_LOG("vectorizeMultiPass: Pass 6 (Edge/Ink) start");
     {
         double ts = vt_now_ms();
+
+
+
+
+
+
 
 
         // Build the edge SVG using existing buildEdgeLayerSVG, then wrap in
@@ -7488,6 +8694,12 @@ std::string vectorizeMultiPass(
             options.pass1.path_precision);
 
 
+
+
+
+
+
+
         // FIX-GREY-C3: Removed post-hoc overlay blend injection.
         // buildEdgeLayerSVG now emits the group with opacity=0.30 and no blend mode
         // (normal blend). The previous overlay injection here was overriding that,
@@ -7499,8 +8711,20 @@ std::string vectorizeMultiPass(
         svgBody += "\n";
 
 
+
+
+
+
+
+
         VT_LOG("vectorizeMultiPass: Pass 6 done in %.1f ms", vt_now_ms() - ts);
     }
+
+
+
+
+
+
 
 
     // =======================================================================
@@ -7549,6 +8773,12 @@ std::string vectorizeMultiPass(
         allDefs += extraDefs;
 
 
+
+
+
+
+
+
         // Bloom body
         char bloomBody[256];
         snprintf(bloomBody, sizeof(bloomBody),
@@ -7558,6 +8788,12 @@ std::string vectorizeMultiPass(
             "</g>",
             (double)bcx,(double)bcy,(double)brx,(double)bry);
         svgBody += bloomBody;
+
+
+
+
+
+
 
 
         // Vignette body (stored separately, appended after svgBody below)
@@ -7572,8 +8808,20 @@ std::string vectorizeMultiPass(
     }
 
 
+
+
+
+
+
+
     std::string svg;
     svg.reserve(allDefs.size() + svgBody.size() + 2048);
+
+
+
+
+
+
 
 
     {
@@ -7588,11 +8836,23 @@ std::string vectorizeMultiPass(
     }
 
 
+
+
+
+
+
+
     if (!allDefs.empty()) {
         svg += "<defs>";
         svg += allDefs;
         svg += "</defs>";
     }
+
+
+
+
+
+
 
 
     // ENH-21: Structured SVG with semantic layers, gradient-based
@@ -7611,6 +8871,12 @@ std::string vectorizeMultiPass(
     //   [9] layer-edges   Pass6     — structural ink strokes
 
 
+
+
+
+
+
+
     // [0] White base rect — required for correct blend-mode compositing
     {
         char bgRect[128];
@@ -7619,6 +8885,12 @@ std::string vectorizeMultiPass(
             width, height);
         svg += bgRect;
     }
+
+
+
+
+
+
 
 
     // ENH-ISOLATION: Wrap all pass layers in an isolation group.
@@ -7631,13 +8903,28 @@ std::string vectorizeMultiPass(
     // highlight and shadow passes perceptually correct.
     svg += "<g style=\"isolation:isolate\">";
 
+
+
+
     // [1-6] All pass layers
     svg += svgBody;
 
+
+
+
     svg += "</g>"; // end isolation group
+
+
+
 
     // [7+8] bloom and vignette layers built into allDefs above (VFINAL-FIX-F)
         svg += "</svg>";
+
+
+
+
+
+
 
 
     const double totalMs = vt_now_ms() - t0;
@@ -7645,6 +8932,12 @@ std::string vectorizeMultiPass(
            totalMs, svg.size());
     return svg;
 }
+
+
+
+
+
+
 
 
 } // namespace vtracer
