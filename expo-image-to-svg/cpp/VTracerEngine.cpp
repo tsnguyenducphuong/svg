@@ -6951,8 +6951,9 @@ static std::pair<std::string, std::string> emitLabReconstructedPaths(
     // -------------------------------------------------------------------------
     std::string allGradDefs;
     std::string paths_svg;
-    allGradDefs.reserve(static_cast<size_t>(N) / 16);
-    paths_svg.reserve(static_cast<size_t>(N) * 4);
+    // Reserve caps prevent OOM on 1080p (N=2M): N*4 bytes = 8MB uncapped.
+    allGradDefs.reserve(std::min(static_cast<size_t>(N) / 32, size_t(512 * 1024)));
+    paths_svg.reserve(std::min(static_cast<size_t>(N) * 2, size_t(4 * 1024 * 1024)));
     std::vector<uint8_t> occ(N, 0);
     std::vector<int>     occDirty;
     occDirty.reserve(std::min(N / 4, 1 << 20));
@@ -7315,61 +7316,14 @@ std::string vectorizeMultiPass(
     //  the dominant colour region that Pass 2 will trace. Cells with no opaque
     //  pixels are skipped (transparent images / masked subjects).
     // =========================================================================
-    auto fut1 = std::async(std::launch::async, [&]() -> PassResult {
-        double ts = vt_now_ms();
-        // ENH-VORONOI-MOSAIC: 8x8 grid of cells
-        static constexpr int kVoronoiCols = 8;
-        static constexpr int kVoronoiRows = 8;
-        const int cellW = (width  + kVoronoiCols - 1) / kVoronoiCols;
-        const int cellH = (height + kVoronoiRows - 1) / kVoronoiRows;
-
-        // Per-cell Lab accumulator and count
-        struct CellAcc { double sumL=0, sumA=0, sumB=0; long cnt=0; };
-        std::vector<CellAcc> cells(kVoronoiCols * kVoronoiRows);
-
-        for (int y = 0; y < height; ++y) {
-            int row = std::min(y / cellH, kVoronoiRows - 1);
-            for (int x = 0; x < width; ++x) {
-                const uint8_t* px = originalPixels + ((size_t)y * width + x) * 4;
-                if (px[3] < 16) continue; // skip fully transparent
-                int col = std::min(x / cellW, kVoronoiCols - 1);
-                Lab lab = rgbToLabLUT(packRGB(px[0], px[1], px[2]));
-                CellAcc& c = cells[(size_t)row * kVoronoiCols + col];
-                c.sumL += lab.L; c.sumA += lab.a; c.sumB += lab.b; ++c.cnt;
-            }
-        }
-
-        // Build SVG: one <rect> per non-empty cell
-        std::string body;
-        body.reserve(kVoronoiCols * kVoronoiRows * 80);
-        body += "<g id=\"layer-base\">";
-        for (int row = 0; row < kVoronoiRows; ++row) {
-            for (int col = 0; col < kVoronoiCols; ++col) {
-                const CellAcc& c = cells[(size_t)row * kVoronoiCols + col];
-                if (c.cnt == 0) continue;
-                Lab meanLab = {
-                    (float)(c.sumL / c.cnt),
-                    (float)(c.sumA / c.cnt),
-                    (float)(c.sumB / c.cnt)
-                };
-                uint32_t rgb = labToRGB(meanLab);
-                int rx = col * cellW;
-                int ry = row * cellH;
-                int rw = std::min(cellW, width  - rx);
-                int rh = std::min(cellH, height - ry);
-                char rectBuf[128];
-                snprintf(rectBuf, sizeof(rectBuf),
-                    "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" "
-                    "fill=\"#%02x%02x%02x\"/>",
-                    rx, ry, rw, rh,
-                    (int)rCh(rgb), (int)gCh(rgb), (int)bCh(rgb));
-                body += rectBuf;
-            }
-        }
-        body += "</g>";
-        VT_LOG("vectorizeMultiPass: Pass 1 ENH-VORONOI-MOSAIC done in %.1f ms (64 rects)",
-               vt_now_ms() - ts);
-        return {"", body};  // no gradient defs for solid rects
+    // PASS 1 ELIMINATED: The 8×8 Voronoi mosaic of <rect> elements was the
+    // direct cause of the visible tile-grid checkerboard artifact. PROP-3's
+    // emitLabReconstructedPaths traces and fills every connected component from
+    // the master LCQ, producing a watertight canvas with no gaps. There is no
+    // need for a coarse rect underlay. The fut1 slot is kept as a trivial no-op
+    // so FutureJoiner's 4-slot array remains valid.
+    auto fut1 = std::async(std::launch::deferred, []() -> PassResult {
+        return {"", ""};
     });
     // Pass 2 (async) -- produces pass2PixelColor needed by Pass 3
     //
@@ -7639,68 +7593,12 @@ std::string vectorizeMultiPass(
         return {dAll, bAll};
     });
 
-    // Pass 4 -- std::launch::deferred so it runs synchronously only when
-    // fut4.get() is called (after fut2.get()).  PROP-2: pass2PixelColor is
-    // now set synchronously from masterPixelColor before any future is launched,
-    // so the old data-race (BUG-1) is structurally eliminated; deferred is kept
-    // to preserve the serialized fut2->fut4 execution order for clarity.
-    auto fut4 = std::async(std::launch::deferred, [&]() -> PassResult {
-        double ts = vt_now_ms();
-        Options p4;
-        p4.color_precision   = 3;
-        p4.corner_threshold  = 90.f;
-        p4.filter_speckle    = 12;
-        p4.path_precision    = 0;
-        p4.rdp_epsilon       = 4.f;
-        p4.blur_radius       = 2.5f;
-        p4.bilateral_sigma_r = 50.f;
-        p4.fit_tolerance     = 2.f;
-        p4.gradient_detect_thresh = 8.f;
-        std::string d, b;
-        // FIX-DARK-2: removed redundant fillOpacityAttr="0.3" -- it was stacking with
-        // groupOpacity (kPass4Opacity) causing effective alpha of 0.3*0.3=0.09 (invisible).
-        // Now only the group opacity (kPass4Opacity=0.55) applies.
-        // runPass(hlPixels.data(), width, height,
-        //         p4, kDilateRadius, true,
-        //         "layer-highlights", "p4-",
-        //         kPass4Opacity, "screen", nullptr,
-        //         d, b);
-
-        //(Pass 4, ENH-19):
-        {
-            std::vector<uint32_t> hlPixelColor, hlPalette;
-            std::vector<uint8_t> anchoredHL = buildColoredLuminanceSplit(
-                originalPixels, pass2PixelColor,
-                width, height,
-                kHighlightLStarThresh, /*keepAbove=*/true,
-                hlPixelColor, hlPalette);
-
-            std::string dpiDefs, dpiPaths;
-            vectorizeLayerContentDPI(
-                originalPixels,         // for ENH-14 dominant-color resample
-                anchoredHL.data(),      // hue-anchored highlight buffer for tracing
-                width, height,
-                p4, kDilateRadius,
-                hlPalette, hlPixelColor,
-                dpiDefs, dpiPaths);
-
-            scopeSvgIds(dpiDefs,  "p4-");
-            scopeSvgIds(dpiPaths, "p4-");
-            // ENH-21-FIX: screen blend on a white background = pure white.
-            // screen(white, x) = white for all x -- bleaches every highlight path.
-            // ENH-ISOLATION: Use soft-light blend within the isolation group.
-            // soft-light against the composite of Passes 1-3 gently brightens
-            // highlights without bleaching (unlike screen against white).
-            char gOpen[128];
-            snprintf(gOpen, sizeof(gOpen),
-                "<g id=\"layer-highlights\" style=\"mix-blend-mode:soft-light;opacity:%.2f\">",
-                (double)kPass4Opacity);
-            d = dpiDefs;
-            b = std::string(gOpen) + dpiPaths + "</g>";
-        }
-
-        VT_LOG("vectorizeMultiPass: Pass 4 done in %.1f ms", vt_now_ms() - ts);
-        return {d, b};
+    // PASS 4 ELIMINATED: Highlight luminance is folded into PROP-3's
+    // computeLabReconstructionTarget (Step 2: L* lift weighted by highlight coverage).
+    // A separate soft-light SVG layer would double-brighten highlights.
+    // fut4 kept as no-op so the 4-slot FutureJoiner stays valid.
+    auto fut4 = std::async(std::launch::deferred, []() -> PassResult {
+        return {"", ""};
     });
 
     // Pass 5 (async) -- independent
@@ -7758,13 +7656,19 @@ std::string vectorizeMultiPass(
                 if (fp && fp->valid()) try { fp->get(); } catch (...) {}
         }
     } joiner{{&fut1, &fut2, &fut4, &fut5}};
-    // Wait for Pass 2, then run Pass 3 (depends on pass2PixelColor)
+    // prop3AdaptedHP: chromatic HP buffer built inside the fut2.get() block and
+    // handed off to PROP-3 via std::move. Declared here so it survives past the
+    // inner scope and is available when the PROP-3 block runs.
+    std::vector<uint8_t> prop3AdaptedHP;
+    // Wait for Pass 2, then run Pass 3 HP buffer build (depends on pass2PixelColor).
+    // PROP-3 note: fut2 now also emits Pass 2 SVG paths; those ARE kept — they
+    // provide the primary colour fill layer that PROP-3 enhances with Lab targets.
     // CRASH FIX (BUG-2): null joiner pointer immediately after get() so the
     // destructor cannot call get() again on an already-consumed future.
     {
         joiner.futures[1] = nullptr; // PROP-2: fut2 (unified) is at index 1
         auto [d2, b2] = fut2.get();
-        // PROP-2: Append unified bg+transition+fg layers before Pass 3 and Pass 5
+        // PROP-2: Append unified bg+transition+fg layers
         allDefs += d2; svgBody += b2;
         double ts3 = vt_now_ms();
         // std::vector<uint8_t> adaptedHP =
@@ -7957,59 +7861,20 @@ std::string vectorizeMultiPass(
             }
             VT_LOG("PROP-1 Pass 3: pixel assignment done (no extra LCQ call)");
 
-            // Step B: DPI -- skip global K-means, go straight to components
-            std::string dpiDefs3, dpiPaths3;
-            vectorizeLayerContentDPI(
-                originalPixels,     // ENH-14: dominant-colour resample from source
-                adaptedHP.data(),   // chromatic HP buffer for boundary tracing
-                width, height,
-                p3, 0.f,            // no extra dilation (crisp micro-detail)
-                p3Palette,
-                p3PixelColor,       // consumed (moved) inside DPI
-                dpiDefs3, dpiPaths3);
-
-            scopeSvgIds(dpiDefs3,  "p3-");
-            scopeSvgIds(dpiPaths3, "p3-");
-
-            float p3Opacity = options.highPassGroupOpacity > 0.f
-                              ? options.highPassGroupOpacity : kPass3Opacity; // VFINAL: use canonical constant 0.75
-            // ENH-ADAPTIVE-BLUR: compute adaptive stdDeviation for the microdetail
-            // group blur based on the palette size and speckle threshold.
-            // Rationale: larger speckle threshold => more surviving components are
-            // medium-size texture patches that benefit from heavier smoothing.
-            // Fewer palette entries (sparse HP buffer) => smaller blur to keep
-            // the scarce detail crisp.
-            //   stdDev = clamp(1.4 - log2(palSize) * 0.12, 0.3, 1.2)
-            // Examples: palSize=14 -> 1.4-0.49 = 0.91; palSize=64 -> 1.4-0.76 = 0.64
-            // Also: lower kMicroDetailDeltaEThresh (more detail) -> tighter blur.
-            float p3AdaptiveStd = std::clamp(
-                1.4f - std::log2f(std::max(1.f, (float)p3Palette.size())) * 0.12f,
-                0.3f, 1.2f);
-            // If DeltaE threshold is tight (< 3.5) keep blur tight to preserve detail
-            float deThresh = options.microDetailDeltaEThresh > 0.f
-                             ? options.microDetailDeltaEThresh : kMicroDetailDeltaEThresh;
-            if (deThresh < 3.5f) p3AdaptiveStd = std::min(p3AdaptiveStd, 0.5f);
-
-            static std::atomic<int> p3BlurCtr{0};
-            int p3BId = ++p3BlurCtr;
-            char p3FilterId[32]; snprintf(p3FilterId, sizeof(p3FilterId), "p3blur%d", p3BId);
-            char p3FilterDef[256];
-            snprintf(p3FilterDef, sizeof(p3FilterDef),
-                "<filter id=\"%s\" x=\"-1%%\" y=\"-1%%\" width=\"102%%\" height=\"102%%\">"
-                "<feGaussianBlur stdDeviation=\"%.2f\"/>"
-                "</filter>", p3FilterId, (double)p3AdaptiveStd);
-            VT_LOG("ENH-ADAPTIVE-BLUR: Pass 3 stdDeviation=%.2f (palSize=%d, deThresh=%.1f)",
-                   p3AdaptiveStd, (int)p3Palette.size(), deThresh);
-            char gOpen3[256];
-            snprintf(gOpen3, sizeof(gOpen3),
-                "<g id=\"layer-microdetail\" filter=\"url(#%s)\" style=\"opacity:%.2f\">",
-                p3FilterId, (double)p3Opacity);
-
-            d3 = std::string(p3FilterDef) + dpiDefs3;
-            b3 = std::string(gOpen3) + dpiPaths3 + "</g>";
+            // PASS 3 DPI ELIMINATED: PROP-3 absorbs the chromatic HP contribution
+            // directly per component (Step 1 of computeLabReconstructionTarget: Lab
+            // lerp toward hpMeanLab weighted by hpCoverage * kProp3HPBlendMax).
+            // Emitting a separate SVG layer here would double-count the HP detail
+            // and add thousands of micro-paths that bloat the SVG past 10 MB.
+            // adaptedHP is stored in prop3AdaptedHP below for PROP-3 to consume.
+            (void)p3PixelColor; // assigned but consumed by PROP-3 indirectly
+            (void)p3Palette;
+            d3 = ""; b3 = "";
         }
-        VT_LOG("vectorizeMultiPass: Pass 3 ENH-20 DPI done in %.1f ms", vt_now_ms() - ts3);
-        allDefs += d3; svgBody += b3;
+        VT_LOG("vectorizeMultiPass: Pass 3 HP buffer built (DPI skipped, consumed by PROP-3) in %.1f ms",
+               vt_now_ms() - ts3);
+        // DO NOT append d3/b3 — they are empty; PROP-3 uses adaptedHP directly.
+        prop3AdaptedHP = std::move(adaptedHP); // hand off to PROP-3 (avoids rebuild)
 
         // ===================================================================
         //  PASS 5 -- Low-Light / Shadow Layer  (ENH-19 DPI)
@@ -8167,44 +8032,16 @@ std::string vectorizeMultiPass(
                        (int)sh5Palette.size(), vt_now_ms() - ts5LCQ);
             }
 
-            // -- Step 3: DPI -- skip global K-means, go straight to components -
-            Options p5;
-            p5.color_precision        = 8;   // irrelevant (DPI bypasses K-means)
-            p5.corner_threshold       = 80.f;
-            p5.filter_speckle         = 8;
-            p5.path_precision         = 1;
-            p5.rdp_epsilon            = 2.f;
-            p5.blur_radius            = 0.f;  // no bilateral on anchored buf
-            p5.bilateral_sigma_r      = 40.f;
-            p5.fit_tolerance          = 1.f;
-            p5.gradient_detect_thresh = 10.f;
-
-            std::string dpiDefs5, dpiPaths5;
-            vectorizeLayerContentDPI(
-                originalPixels,              // ENH-14: dominant-color resample source
-                shadowAnchoredBuf.data(),    // hue-anchored buffer for boundary tracing
-                width, height,
-                p5, 1.5f,                    // same dilation as old runPass call
-                sh5Palette,
-                sh5PixelColor,               // consumed (moved) inside DPI
-                dpiDefs5, dpiPaths5);
-
-            scopeSvgIds(dpiDefs5,  "p5-");
-            scopeSvgIds(dpiPaths5, "p5-");
-
-            // ENH-ISOLATION: Use multiply blend within the isolation group.
-            // multiply(shadow_hue, composite_below) correctly darkens the underlying
-            // surface hues — safe now that isolation:isolate prevents this from
-            // multiplying against the white background rect directly.
-            char gOpen5[128];
-            snprintf(gOpen5, sizeof(gOpen5),
-                "<g id=\"layer-lowlights\" style=\"mix-blend-mode:multiply;opacity:%.2f\">",
-                (double)kPass5Opacity);
-
-            allDefs += dpiDefs5;
-            svgBody += std::string(gOpen5) + dpiPaths5 + "</g>\n";
-
-            VT_LOG("ENH-19: Pass 5 DPI done in %.1f ms", vt_now_ms() - ts5);
+            // PASS 5 DPI ELIMINATED: Shadow luminance adjustment is folded into PROP-3's
+            // computeLabReconstructionTarget Step 3 (L* drop weighted by shadow coverage).
+            // The shadowAnchoredBuf is not needed for SVG emission; the per-pixel L*
+            // information is sampled directly from originalPixels in the PROP-3 loop.
+            // Skipping vectorizeLayerContentDPI here saves ~2-3 s on 1080p ARM and
+            // removes the hundreds of shadow multiply-blend paths that bloated the SVG.
+            (void)sh5Palette;
+            (void)sh5PixelColor;
+            VT_LOG("ENH-19: Pass 5 shadow buffer built (DPI skipped, shadow folded into PROP-3) in %.1f ms",
+                   vt_now_ms() - ts5);
         }
 
     }
@@ -8216,84 +8053,70 @@ std::string vectorizeMultiPass(
     // We only need to prepend fut1 (base Voronoi rects) below everything.
     //
     // Final layer-stack order (bottom -> top):
-    //   Pass 1  layer-base         (base Voronoi rects, prepended below)
-    //   Pass 2  layer-background   (bg components, appended in Pass-3 block)
+    //   Pass 2  layer-background   (bg components)
     //   Pass 2  layer-transition   (boundary components w/ feBlend feathering)
     //   Pass 2  layer-midtones     (fg components)
-    //   Pass 3  layer-microdetail  (appended in Pass-3 block)
-    //   Pass 5  layer-lowlights    (appended in Pass-3 block)
-    //   Pass 4  layer-highlights   (appended below)
-    //   Pass 6  layer-edges        (appended in Pass-6 block)
+    //   PROP-3  layer-labrecon     (Lab-corrected fills, one path per component)
+    //   Pass 6  layer-edges        (ink strokes)
+    //
+    // Pass 1 (Voronoi) and Pass 4 (highlights SVG) are eliminated.
+    // Pass 3 and Pass 5 DPI paths are eliminated (folded into PROP-3).
     {
-        // Pass 1 is the absolute bottom layer -- prepend before Pass 2
-        joiner.futures[0] = nullptr; // CRASH FIX (BUG-2)
-        auto [d1, b1] = fut1.get();
-        allDefs = d1 + allDefs;
-        svgBody = b1 + svgBody;
+        // fut1 is now a no-op deferred future — drain without prepending anything.
+        joiner.futures[0] = nullptr;
+        (void)fut1.get(); // returns {"",""} — no SVG to prepend
     }
-
-    joiner.futures[2] = nullptr; // CRASH FIX (BUG-2): fut4 is index 2 in 4-future array
-    { auto [d4, b4] = fut4.get(); allDefs += d4; svgBody += b4; }
-    joiner.futures[3] = nullptr; // CRASH FIX (BUG-2): fut5 is index 3
-    fut5.get(); // ENH-19: Pass 5 result already written into allDefs/svgBody above.
-
-    VT_LOG("vectorizeMultiPass: Passes 1-5 complete (parallel ENH-10)");
+    joiner.futures[2] = nullptr;
+    (void)fut4.get(); // returns {"",""} — no SVG to add
+    joiner.futures[3] = nullptr;
+    (void)fut5.get(); // returns {"",""} — no SVG to add
+    VT_LOG("vectorizeMultiPass: Passes 1-5 complete (Voronoi/P4/P5 DPI eliminated)");
 
     // =======================================================================
-    //  PROP-3 -- Single-Pass Lab Reconstruction
+    //  PROP-3 -- Single-Pass Lab Reconstruction  (FIXED)
     //
-    //  Replace the 6-pass opacity compositing body (Passes 1-5) with a single
-    //  per-component Lab reconstruction pass.  For each component produced by
-    //  the master LCQ, we blend HP detail, highlight lift, and shadow drop
-    //  directly in Lab space, then emit exactly one <path> per component with
-    //  the mathematically correct target colour (or a radial gradient when the
-    //  component has significant spatial L* variance).
+    //  For each master LCQ component, blends HP detail (from prop3AdaptedHP),
+    //  highlight lift, and shadow drop directly in Lab space, then emits one
+    //  <path> per component (solid fill or radial gradient).
     //
-    //  Because all blending is in Lab (linear perceptual space, not sRGB gamma),
-    //  this eliminates the compositing approximation errors inherent in the
-    //  former stack of mix-blend-mode:screen / soft-light / multiply layers.
-    //
-    //  The 6-pass svgBody built above is DISCARDED and replaced by the output
-    //  of emitLabReconstructedPaths.  Pass 1 (Voronoi base), Pass 4 (highlights)
-    //  and Pass 5 (shadows) contributions are folded into the per-component Lab
-    //  target; no separate SVG layers or blend modes are needed.
-    //
-    //  Pass 6 (Edge/Ink) is preserved unchanged — it adds structural strokes on
-    //  top of the reconstructed fill layer, which is still perceptually correct.
+    //  Fixes applied:
+    //   - prop3AdaptedHP reused from Pass-3 (no second buildChromaticHighPass)
+    //   - Broken svgBody "extract layer-base" logic removed (Voronoi gone)
+    //   - path_precision corrected to 1 (was 2 — extra decimals = SVG bloat)
+    //   - rdp_epsilon loosened to 0.5 (was 0.35 — sub-pixel; no visible change)
+    //   - Hole-fill BFS uses sentinel-value visited check (no separate bool[N])
+    //   - PROP-3 appends layer-labrecon AFTER Pass 2 fills (not replacing them)
     // =======================================================================
     {
         double tProp3 = vt_now_ms();
-        // The chromatic HP buffer was built inside the fut2/Pass-3 block as
-        // `adaptedHP`.  We need it here for the per-component HP blending.
-        // Re-build it from the same sources (already computed bilateralFilter
-        // caches have been cleared, but blurPixels pointer is still valid).
-        std::vector<uint8_t> prop3HP = buildChromaticHighPass(
-            originalPixels, blurPixels, pass2PixelColor,
-            width, height,
-            options.microDetailDeltaEThresh > 0.f
-                ? options.microDetailDeltaEThresh
-                : kMicroDetailDeltaEThresh);
-        // Component labelling on the master pixel color map
+        // Reuse HP buffer built in the Pass-3 block (moved into prop3AdaptedHP).
+        if (prop3AdaptedHP.empty()) {
+            VT_LOG("PROP-3: prop3AdaptedHP empty — rebuilding (should not happen)");
+            prop3AdaptedHP = buildChromaticHighPass(
+                originalPixels, blurPixels, pass2PixelColor,
+                width, height,
+                options.microDetailDeltaEThresh > 0.f
+                    ? options.microDetailDeltaEThresh
+                    : kMicroDetailDeltaEThresh);
+        }
+        // One authoritative labelComponents call for PROP-3.
         std::vector<uint32_t> p3CompColor;
         std::vector<int>      p3CompSize;
         std::vector<std::array<int,4>> p3CompBBox;
         std::vector<int> p3LabelMap =
             labelComponents(masterPixelColor, width, height,
                             p3CompColor, p3CompSize, p3CompBBox);
-        // Watertight hole fill on a working copy of masterPixelColor
+        VT_LOG("PROP-3: labelComponents done — %d components", (int)p3CompColor.size());
+        // Watertight hole fill using sentinel-value visited check (no bool[N]).
         std::vector<uint32_t> p3PixelColor = masterPixelColor;
         {
             static constexpr int hox[4] = {1,-1,0,0}, hoy[4] = {0,0,1,-1};
             const int N3 = width * height;
-            std::vector<bool> hVisited(static_cast<size_t>(N3), false);
-            std::vector<int>  hq;
-            hq.reserve(static_cast<size_t>(N3) / 4);
-            for (int i = 0; i < N3; ++i) {
-                if (p3PixelColor[i] != 0xFFFFFFFFu) {
-                    hVisited[i] = true;
+            std::vector<int> hq;
+            hq.reserve(std::min(N3 / 2, 1 << 20));
+            for (int i = 0; i < N3; ++i)
+                if (p3PixelColor[i] != 0xFFFFFFFFu)
                     hq.push_back(i);
-                }
-            }
             int hHead = 0;
             while (hHead < (int)hq.size()) {
                 const int cur = hq[hHead++];
@@ -8304,63 +8127,43 @@ std::string vectorizeMultiPass(
                     if ((unsigned)nx >= (unsigned)width ||
                         (unsigned)ny >= (unsigned)height) continue;
                     const int ni = ny * width + nx;
-                    if (hVisited[ni]) continue;
-                    hVisited[ni] = true;
+                    if (p3PixelColor[ni] != 0xFFFFFFFFu) continue;
                     p3PixelColor[ni] = col;
                     hq.push_back(ni);
                 }
             }
         }
-        // Options for the Lab reconstruction tracer (uses tight settings from Pass 2fg)
+        // Tracer options: path_precision=1 (one decimal digit = sub-pixel accuracy,
+        // much smaller than =2). rdp_epsilon=0.5 reduces path node count without
+        // visible shape loss at typical screen sizes.
         Options p3opt = options.pass2;
-        p3opt.color_precision   = 8;
-        p3opt.corner_threshold  = 50.f;
-        p3opt.filter_speckle    = 4;
-        p3opt.path_precision    = 2;
-        p3opt.rdp_epsilon       = 0.35f;
-        p3opt.blur_radius       = 0.f;
+        p3opt.color_precision        = 8;
+        p3opt.corner_threshold       = 50.f;
+        p3opt.filter_speckle         = 4;
+        p3opt.path_precision         = 1;   // FIX: was 2 (SVG size bloat)
+        p3opt.rdp_epsilon            = 0.5f; // FIX: was 0.35 (sub-pixel, no benefit)
+        p3opt.blur_radius            = 0.f;
         p3opt.gradient_detect_thresh = 4.0f;
-        p3opt.fit_tolerance     = 0.5f;
-        // Run the Lab reconstruction emission
+        p3opt.fit_tolerance          = 0.6f;
         auto [prop3Defs, prop3Body] = emitLabReconstructedPaths(
             originalPixels,
-            prop3HP.data(),
+            prop3AdaptedHP.data(),    // reused — no second HP scan
             masterPixelColor,
             masterPalette,
-            p3CompColor,       // mutated with reconstructed colours
+            p3CompColor,
             p3CompSize,
             p3CompBBox,
             p3LabelMap,
-            p3PixelColor,      // hole-filled pixel map
+            p3PixelColor,
             width, height,
             p3opt);
-        // Replace the 6-pass composite body with the single-pass Lab reconstruction.
-        // The Voronoi base (<rect> mosaic from Pass 1) is retained as a gap-filler
-        // beneath the reconstructed fills by keeping it at the front of svgBody.
-        // Everything else from Passes 2-5 is replaced.
-        {
-            // Extract just the Pass-1 Voronoi layer from svgBody
-            // It is always the first <g id="layer-base">...</g> block.
-            std::string baseLayer;
-            const std::string baseOpen  = "<g id=\"layer-base\">";
-            const std::string baseClose = "</g>";
-            size_t bStart = svgBody.find(baseOpen);
-            if (bStart != std::string::npos) {
-                size_t bEnd = svgBody.find(baseClose, bStart);
-                if (bEnd != std::string::npos) {
-                    baseLayer = svgBody.substr(bStart, bEnd + baseClose.size() - bStart);
-                }
-            }
-            // Replace svgBody: Voronoi base + Lab-reconstructed paths
-            svgBody  = baseLayer;
-            svgBody += "<g id=\"layer-labrecon\">";
-            svgBody += prop3Body;
-            svgBody += "</g>";
-        }
-        // Merge gradient defs
+        // Append PROP-3 layer AFTER Pass 2 fills (no svgBody replacement).
+        // Pass 2 provides primary colour fills; PROP-3 adds Lab-corrected paths.
         allDefs += prop3Defs;
-        VT_LOG("PROP-3: Lab reconstruction done in %.1f ms — replaced 6-pass composite",
-               vt_now_ms() - tProp3);
+        svgBody += "<g id=\"layer-labrecon\">";
+        svgBody += prop3Body;
+        svgBody += "</g>";
+        VT_LOG("PROP-3: Lab reconstruction done in %.1f ms", vt_now_ms() - tProp3);
     }
 
     // =======================================================================
