@@ -522,7 +522,7 @@ namespace vtracer {
 // -----------------------------------------------------------------------------
 static constexpr int   kDefaultColorPrecision  = 6;
 static constexpr float kDefaultCornerThreshold = 120.f;
-static constexpr int   kDefaultFilterSpeckle   = 4;
+static constexpr int   kDefaultFilterSpeckle   = 2;  // Fix-D: was 4 — kills flowers/petals at 2-3px
 static constexpr float kDefaultRdpEpsilon      = 1.5f;
 // ENH-SCALE-RDP: Scale-dependent RDP epsilon -- small components use a tighter
 // epsilon to preserve micro-curve fidelity (eyelashes, wire edges, petal veins).
@@ -614,8 +614,8 @@ private:
 // 24×24×32 = 18 432 palette entries produced tens of thousands of micro-paths
 // (circuit-board glitch in output). 12×12×12 = 1 728 max entries gives broad,
 // well-defined colour regions that compose cleanly across layers.
-static constexpr int   kLCQGridW               = 16;  // FINAL-FIX: 12 was too coarse, lost colour regions
-static constexpr int   kLCQGridH               = 16;
+static constexpr int   kLCQGridW               = 24;  // Fix-A: was 16 — 24×24 → 44px tiles, finer quantisation
+static constexpr int   kLCQGridH               = 24;  // Fix-A: was 16
 // FIX-COLOR-2: Raised from 24 -> 32 to preserve more local palette richness.
 // 24 was the "midpoint" of 16-32 but caused premature color collapse on complex scenes.
 // ENH-21-FIX: colours/tile 32→12. Fewer colours per tile forces K-means to
@@ -625,7 +625,7 @@ static constexpr int   kLCQColorsPerTile       = 20;  // FINAL-FIX: 12 collapsed
 // The master run replaces 4 independent LCQ calls (Passes 2a, 2b, 3, 5) with one
 // run at higher quality.  The extra ~33% tiles cost is recovered by eliminating the
 // 3 redundant runs entirely.  Freed thread budget is redirected to the tracer.
-static constexpr int   kMasterLCQColorsPerTile = 32;
+static constexpr int   kMasterLCQColorsPerTile = 48;  // Fix-H: was 32 — richer palette where surfaces overlap
 // Adaptive Threshold for Pass 3 (Micro-Detail) -- DeltaE below this -> suppress
 // FIX-GREY-G: Raised kMicroDetailDeltaEThresh 2.0->4.0.
 // adaptiveThresholdHighPass only passes pixels whose highPass colour
@@ -660,7 +660,7 @@ static constexpr float kVarMid  = 150.0f;
 //                       its tile to contribute weight to the blended anchor.
 //                       Guards against near-empty fringe tiles skewing the
 //                       merged colour toward an unrepresentative sample.
-static constexpr float kStitchThresh      = 3.5f;  // DeltaE for Pass A centroid merge
+static constexpr float kStitchThresh      = 2.2f;  // Fix-B: was 3.5 — tighter merge eliminates sky/snow seams
 static constexpr float kSeamRepairThresh  = 2.5f;  // DeltaE for Pass B pixel reclassify
 static constexpr int   kStitchMinCount    = 8;     // min pixels for weighted average
 // Micro-suppression relaxation for detail passes (lower = more micro-components)
@@ -700,7 +700,7 @@ static constexpr float kProp3HPBlendMax        = 0.85f;  // maximum Lab lerp tow
 // Minimum HP coverage fraction in a component to blend HP contribution at all
 static constexpr float kProp3HPMinCoverage     = 0.05f;
 // Highlight / shadow luminance adjustment clamps (DeltaL in Lab space)
-static constexpr float kProp3HLMaxDeltaL       = 22.f;   // max L* lift from highlights
+static constexpr float kProp3HLMaxDeltaL       = 14.f;   // Fix-E: was 22 — over-lifted to near-white, losing hue
 static constexpr float kProp3SHMaxDeltaL       = 18.f;   // max L* drop from shadows
 // Minimum fraction of highlight/shadow pixels in a component to apply adjustment
 static constexpr float kProp3HLMinCoverage     = 0.08f;
@@ -6681,6 +6681,10 @@ static LabReconResult computeLabReconstructionTarget(
     long   hpCnt = 0, totalCnt = 0;
     double hlDeltaL = 0; long hlCnt = 0;
     double shDeltaL = 0; long shCnt = 0;
+    // Fix-F: accumulate raw a*/b* from originalPixels across all component
+    // pixels. Used to correct chroma when bilateral blur has flattened the
+    // HP delta (small |da|,|db|), which leaves the blended target desaturated.
+    double origA_acc = 0, origB_acc = 0; long origChromaCnt = 0;
     // Centroid for gradient rings
     double cx = 0, cy = 0;
     // Per-ring Lab accumulators for gradient
@@ -6727,6 +6731,8 @@ static LabReconResult computeLabReconstructionTarget(
                     ++hpCnt;
                 }
             }
+            // Fix-F: accumulate raw chroma from originalPixels
+            origA_acc += labOrig.a; origB_acc += labOrig.b; ++origChromaCnt;
             // Highlight / shadow
             float origL = labOrig.L;
             if (origL >= kHighlightLStarThresh) {
@@ -6764,6 +6770,24 @@ static LabReconResult computeLabReconstructionTarget(
             targetLab.a = baseLab.a + blendT * (hpMeanLab.a - baseLab.a);
             targetLab.b = baseLab.b + blendT * (hpMeanLab.b - baseLab.b);
         }
+    }
+    // Fix-F: Direct chroma correction from originalPixels.
+    // When the bilateral blur radius is large, the HP delta |da|,|db| is tiny
+    // and the blended target remains nearly as desaturated as the LCQ base.
+    // Solution: when ≥15% of the component's pixels are opaque, compute the
+    // mean raw a*/b* from originalPixels and lerp targetLab toward it with a
+    // fixed weight of 0.55. This restores chroma without touching L* (luminance
+    // reconstruction from Steps 2-3 remains unaffected).
+    // Weight 0.55 = enough to restore saturation without overshooting on
+    // already-correct components (those with good HP coverage).
+    static constexpr float kOrigChromaBlendThresh  = 0.15f;  // min opaque fraction
+    static constexpr float kOrigChromaBlendWeight  = 0.55f;  // lerp toward mean orig a*/b*
+    if (origChromaCnt > 0 &&
+        (float)origChromaCnt / (float)totalCnt >= kOrigChromaBlendThresh) {
+        float meanOrigA = (float)(origA_acc / origChromaCnt);
+        float meanOrigB = (float)(origB_acc / origChromaCnt);
+        targetLab.a = targetLab.a + kOrigChromaBlendWeight * (meanOrigA - targetLab.a);
+        targetLab.b = targetLab.b + kOrigChromaBlendWeight * (meanOrigB - targetLab.b);
     }
     // -------------------------------------------------------------------------
     //  Step 2: Highlight luminance adjustment (L* only in Lab)
@@ -7048,25 +7072,17 @@ static std::pair<std::string, std::string> emitLabReconstructedPaths(
                 paths.end());
         }
         // -- SVG emit: one <path> per component, Lab-reconstructed fill ------
-        // P6-FIX: Pre-compute white Lab for near-white suppression.
-        // Components whose reconstructed fill is perceptually white (ΔE < 2.5
-        // vs Lab(100,0,0)) are skipped — they would cover coloured fills with
-        // invisible paths and add bytes with no visual contribution.
-        static const Lab kWhiteLab = {100.f, 0.f, 0.f};
+        // Fix-C: near-white suppression (ΔE < 2.5 vs white skip) removed.
+        // It was discarding real light fills: snow (L*≈95), sky (L*≈91),
+        // car body silver (L*≈93) — all within 2.5 ΔE of white and silently
+        // erased, leaving blank patches. PROP-3 only emits components that
+        // actually survived filter_speckle, so there are no invisible-ink paths.
         std::unordered_set<int> emittedLabels;
         for (auto& pr : paths) {
             if (pr.compLabel < 0 || pr.compLabel >= nC) continue;
             std::string d = buildPathD(pr, dp, true);
             if (d.empty()) continue;
             const LabReconResult& recon = reconResults[pr.compLabel];
-            // P6-FIX: skip near-white non-hole fills
-            if (!pr.isHole) {
-                float de = ciede2000(recon.solidLab, kWhiteLab);
-                if (de < 2.5f && !recon.hasGradient) {
-                    emittedLabels.insert(pr.compLabel); // mark as handled (skip rect fallback too)
-                    continue;
-                }
-            }
             if (!pr.isHole && recon.hasGradient) {
                 // Emit gradient def + path with gradient fill
                 // Scope gradient ID with a component-unique prefix
@@ -7592,7 +7608,7 @@ std::string vectorizeMultiPass(
         p3opt.rdp_epsilon            = 0.5f;
         p3opt.blur_radius            = 0.f;
         p3opt.gradient_detect_thresh = 8.0f;  // P7-FIX: was 4.0
-        p3opt.fit_tolerance          = 1.0f;  // P8-FIX: was 0.6
+        p3opt.fit_tolerance          = 0.4f;  // Fix-G: was 1.0 — 10% error on 8px petals; 0.4 gives <5%
 
         auto [prop3Defs, prop3Body] = emitLabReconstructedPaths(
             originalPixels,
