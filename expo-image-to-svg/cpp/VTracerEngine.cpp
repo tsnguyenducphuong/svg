@@ -7179,18 +7179,19 @@ static LabReconResult computeLabReconstructionTarget(
     //       At this point, satGuard still lets some blend through (0.1 minimum),
     //       but even 0.06 applied to a large a*/b* difference matters. Skip entirely.
     static constexpr float kOrigChromaBlendWeight  = 0.60f;  // FIX-WHITE-7: was 0.80
+    bool fixf_skip = false;  // FIX-ENH-B: set true if Fix-F mean correction should be skipped
     if (origChromaCnt > 0 &&
         (float)origChromaCnt / (float)totalCnt >= kOrigChromaBlendThresh) {
         float meanOrigA = (float)(origA_acc / origChromaCnt);
         float meanOrigB = (float)(origB_acc / origChromaCnt);
         // FIX-ENH-B: Early exit if mean is near-achromatic — ENH-22 handles this better
-        {
-            float meanOrigC_early = std::sqrt(meanOrigA * meanOrigA + meanOrigB * meanOrigB);
-            float baseC_early = std::sqrt(baseLab.a * baseLab.a + baseLab.b * baseLab.b);
-            bool meanIsAchromatic = (meanOrigC_early < 6.f);
-            bool meanWouldHeavilyDesaturate = (baseC_early > 20.f && meanOrigC_early < baseC_early * 0.70f);
-            if (meanIsAchromatic || meanWouldHeavilyDesaturate) goto skip_fix_f;  // NOLINT
-        }
+        // FIX-ENH-B: Check if mean would be near-achromatic or heavily desaturating.
+        // If so, skip Fix-F mean correction — ENH-22 chroma-weighted rescue handles it.
+        float meanOrigC_early_ = std::sqrt(meanOrigA * meanOrigA + meanOrigB * meanOrigB);
+        float baseC_early_     = std::sqrt(baseLab.a * baseLab.a + baseLab.b * baseLab.b);
+        fixf_skip = (meanOrigC_early_ < 6.f) ||
+                         (baseC_early_ > 20.f && meanOrigC_early_ < baseC_early_ * 0.70f);
+        if (!fixf_skip) {
 
         // FIX-WHITE-10: Guard against overriding a well-saturated base with a
         // near-neutral mean. If baseLab has C* > 20 AND mean original C* <
@@ -7265,8 +7266,8 @@ static LabReconResult computeLabReconstructionTarget(
             rescueFrac * (adjustedRescueWeight - kOrigChromaBlendWeight)) * satGuard;
         targetLab.a = targetLab.a + effectiveWeight * (rescueA - targetLab.a);
         targetLab.b = targetLab.b + effectiveWeight * (rescueB - targetLab.b);
+        }  // end if (!fixf_skip)
     }
-    skip_fix_f:  // FIX-ENH-B: jump here when mean chroma would desaturate the target
     // -------------------------------------------------------------------------
     //  ENH-22 Standalone Rescue for achromatic-mean components:
     //  When Fix-F was skipped because meanOrigC < 6 (achromatic mean), the
@@ -7279,14 +7280,8 @@ static LabReconResult computeLabReconstructionTarget(
     // -------------------------------------------------------------------------
     if (origChromaCnt > 0 &&
         (float)origChromaCnt / (float)totalCnt >= 0.15f) {
-        // Recompute whether Fix-F was skipped
-        float meanOrigA2 = (float)(origA_acc / origChromaCnt);
-        float meanOrigB2 = (float)(origB_acc / origChromaCnt);
-        float meanOrigC2 = std::sqrt(meanOrigA2 * meanOrigA2 + meanOrigB2 * meanOrigB2);
-        float baseC2 = std::sqrt(baseLab.a * baseLab.a + baseLab.b * baseLab.b);
-        bool wasSkipped = (meanOrigC2 < 6.f) ||
-                          (baseC2 > 20.f && meanOrigC2 < baseC2 * 0.70f);
-        if (wasSkipped && origChromaWt > 16.0) {
+        // FIX-ENH-B: Use fixf_skip flag set by the outer Fix-F block above.
+        if (fixf_skip && origChromaWt > 16.0) {
             // Run chroma-weighted rescue only (no mean component)
             float chromaWtdA2 = (float)(origChromaA_wtd / origChromaWt);
             float chromaWtdB2 = (float)(origChromaB_wtd / origChromaWt);
@@ -7410,7 +7405,6 @@ static LabReconResult computeLabReconstructionTarget(
                     // FIX-ENH-D: Apply ring rescue to the chromaScale-based stop (not lRatio)
                     stopA = stopA + ringFrac * 0.75f * (ringRescueA * chromaScale - stopA);
                     stopB = stopB + ringFrac * 0.75f * (ringRescueB * chromaScale - stopB);
-                }
                 }
 
                 Lab   stopLab   = {
@@ -7552,7 +7546,6 @@ static LabReconResult computeLabReconstructionTarget(
                             float fr2 = 1.f - std::clamp((tC2 - 6.f) / 12.f, 0.f, 1.f);
                             stopA2 = stopA2 + fr2 * 0.75f * (rescA * chromaScale2 - stopA2);
                             stopB2 = stopB2 + fr2 * 0.75f * (rescB * chromaScale2 - stopB2);
-                        }
                         }
                         Lab   sl2 = { stopL2,
                                       stopA2 * (1.f - specDesat2),
