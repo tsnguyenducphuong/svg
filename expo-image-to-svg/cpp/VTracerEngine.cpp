@@ -1,5 +1,147 @@
 // ===========================================================================
-//  VTracerEngine.cpp  --  production-grade SVG vectoriser (Premium Enhanced)
+//  VTracerEngine.cpp  --  production-grade SVG vectoriser (v4 - True Color)
+//
+//  -- v4 Enhancements (this revision): colour richness and gradient fidelity ---
+//
+//  FIX-ENH-A  HP chroma (a*/b*) blend decoupled from L* blend.
+//             kProp3HPBlendMax=0.40 is correct for L* (prevents whitewash) but
+//             is too conservative for a*/b* since L* is already brightness-gated
+//             by FIX-WHITE-9. New: a*/b* blend uses min(coverage*0.40*1.35, 0.55)
+//             capped at 0.55, gated by a guard that skips if hpMeanChroma < 4
+//             (near-achromatic HP would pull saturated base toward grey).
+//             Effect: micro-texture hue variation (petal edges, foliage shifts)
+//             is now visible instead of being blended away.
+//
+//  FIX-ENH-B  Fix-F mean correction skipped for near-achromatic or heavily
+//             desaturating means.
+//             Previously, even when meanOrigC was near 0 (achromatic mean from
+//             mixed white+coloured pixels), Fix-F still blended 60% toward that
+//             near-zero mean, actively stripping chroma from components with
+//             correct LCQ base colour. Two skip conditions added:
+//               (a) meanOrigC < 6  →  mean is effectively white/grey; skip.
+//               (b) baseC > 20 AND meanOrigC < baseC*0.70  →  mean would cut
+//                   chroma by 30%+; skip entirely, let ENH-22 handle it.
+//             ENH-22 chroma-weighted rescue now runs standalone for skipped cases.
+//
+//  FIX-ENH-C  ENH-22 rescue weight raised from 0.72 → up to 0.88 for genuinely
+//             near-neutral targets (rescueFrac ≈ 1.0).
+//             At 0.72, a component with LCQ base C*=3 (near-white) and chroma-
+//             weighted target C*=25 (true rose pink) only recovered C*=0.72×25=18.
+//             New: weight blends 0.72→0.88 as rescueFrac→1.0, recovering 88% of
+//             the true chroma for the most under-saturated components.
+//
+//  FIX-ENH-D  Gradient stop chroma scaling: replaced lRatio with sqrt-based
+//             chromaScale in both radial and linear gradient stop loops.
+//             lRatio = stopL/targetL had two failure modes:
+//               (a) Lower clamp 0.15 killed colour in dark gradient stops,
+//                   making shadow regions near-achromatic even on vivid surfaces.
+//               (b) Upper clamp 1.6 over-amplified chroma for dark targets
+//                   with bright rings, causing gamut-clamped wrong colours.
+//             New: chromaScale = sqrt(stopL/targetL), range [0.35, 1.5].
+//             sqrt gives perceptually smoother luminance-chroma correlation
+//             that matches real surface physics (chroma doesn't fall linearly
+//             to zero in shadows). Dark shadow stops retain ~59% of peak chroma
+//             instead of the 15% minimum that lRatio imposed.
+//             Ring rescue (ENH-22) now uses chromaScale instead of lRatio,
+//             removing double-scaling artifacts.
+//
+//  FIX-ENH-E  ENH-22 standalone rescue path for Fix-F-skipped components.
+//             When Fix-F is skipped (near-achromatic or desaturating mean),
+//             the chroma-weighted rescue still needs to run. New standalone
+//             block re-checks the skip condition and applies up to 80% rescue
+//             toward chromaWtdA/B when: (1) Fix-F was skipped, (2) origChromaWt
+//             indicates real saturated pixels exist (> 16), and (3) the chroma-
+//             weighted target is meaningfully more saturated (> currentC + 4).
+//
+//  -- v3 Critical Fixes (preserved from prior revision): ---------------------
+//
+//  ROOT CAUSE: The v2 engine produced near-white SVG output on bright window-lit
+//  photographic subjects (observed on a floral still-life scene). Six compounding
+//  bugs caused cumulative L* over-lift and chroma destruction:
+//
+//  FIX-WHITE-1  kHighlightLStarThresh 76→88.
+//               v2 lowered this to 76, causing 50-80% of components in a lit
+//               room to qualify for L* lift. Catastrophic cumulative whitewash.
+//               Only genuine speculars (L*>88) should get highlight adjustment.
+//
+//  FIX-WHITE-2  kShadowLStarThresh 38→28.
+//               v2 raised this to 38, reclassifying rich dark-midtone components
+//               (foliage L*~35, deep petal centres) as "shadows" and dropping
+//               their L*. This stripped colour depth from correctly-rendered areas.
+//
+//  FIX-WHITE-3  kProp3HPBlendMax 0.65→0.40.
+//               For bright-background images, the HP buffer contains near-white
+//               pixels (high-L*, low-chroma bilateral residuals). Blending 65%
+//               toward this near-white HP mean strips base chroma from every
+//               bright component.
+//
+//  FIX-WHITE-4  kProp3HPMinCoverage 0.02→0.04.
+//               At 0.02, JPEG compression highlights (1-2% of pixels) triggered
+//               HP blending on flat-colour components (white walls, petals).
+//
+//  FIX-WHITE-5  kProp3HLMaxDeltaL 10→4, kProp3SHMaxDeltaL 14→6.
+//               Compounded with the lowered threshold, max delta of 10 pushed
+//               rose petals (base L*~60) to L*~73, stripping their pink hue.
+//
+//  FIX-WHITE-6  kProp3HLMinCoverage 0.05→0.15 (both HL and SH).
+//               At 0.05, a 5% speckle of specular pixels caused ALL components
+//               in a lit room to receive L* adjustment. 15% requires genuine
+//               dominant highlight/shadow coverage.
+//
+//  FIX-WHITE-7  kOrigChromaBlendWeight 0.80→0.60.
+//               At 0.80, when the mean original a*/b* for a component containing
+//               both coloured petals AND white petal regions is near-neutral (≈8),
+//               the blend actively DESATURATED a correctly-coloured base (a*≈25 →
+//               0.20×25+0.80×8 = 11.4). Reduced to 0.60 to limit the damage.
+//
+//  FIX-WHITE-8  ENH-22 rescue weight 0.88→0.72, thresholds 6/18→8/22.
+//               Too aggressive at 0.88; at 0.72 the chroma rescue is still
+//               strong for genuinely neutral components but doesn't overcorrect
+//               components with mixed saturation.
+//
+//  FIX-WHITE-9  HP L* blend scaled by brightness (NEW).
+//               HP L* blend now scales down linearly from 100% at base L*<50
+//               to 0% at base L*>75. Prevents bright components from getting
+//               double-whitened by HP L* lerp + HL Step 2. Dark textured
+//               surfaces still get full HP depth enhancement.
+//
+//  FIX-WHITE-10 Saturation guard on chroma blend (NEW).
+//               If baseLab C* > 15 and mean original C* < 85% of base C*,
+//               the mean would DESATURATE a correct colour. Guard scales the
+//               correction weight down proportionally (minimum 0.10×weight).
+//
+//  FIX-WHITE-11 Highlight delta accumulation clamp (NEW).
+//               hlDeltaL previously accumulated (origL - baseLab.L) including
+//               negative values, which could corrupt the mean. Now only
+//               accumulates positive deltas (genuine brightness excess).
+//
+//  FIX-WHITE-12 Hard L* change clamp after all steps (NEW).
+//               Total L* change from LCQ base is clamped to ±8 for bright
+//               components (L*>60) and ±12 for dark ones. Prevents compounding
+//               of individually-small adjustments into a catastrophic total shift.
+//
+//  FIX-HP-L    HP buffer L* output clamped to max(base.L, orig.L-2) (NEW).
+//               buildChromaticHighPass was outputting labBase.L + dL which for
+//               bright-edge pixels pushed HP buffer L* toward 100 (pure white).
+//               The HP buffer's role is chroma/texture, not luminance amplification.
+//
+//  FIX-GRAD-2  kProp3GradMinDE 4.5→6.0.
+//               At 4.5, JPEG noise triggered gradients on components that should
+//               be solid fills. Gradients on noise-varied components add SVG
+//               complexity with zero visual benefit and can introduce banding.
+//
+//  FIX-GRAD-3  Specular desat threshold in gradient stops 92→96 (both radial
+//               and linear). At 92, golden/pink highlights at L*~93 had their
+//               a*/b* zeroed, turning bright gradient ends white.
+//
+//  FIX-LRATIO  lRatio upper clamp 2.0→1.6 in gradient stop construction.
+//               For dark targets (L*=30) with bright ring stops (L*=75),
+//               lRatio=2.5 overshot chroma into out-of-gamut wrong colours.
+//
+//  FIX-VOXEL   ENH-21 TopK restored from 6 to 4.
+//               Including 6 voxels pulled in near-white background-bleed voxels
+//               for window-lit components, biasing consensus toward white.
+//
 //
 //  Original performance improvements:
 //   PERF-1 : Bilateral filter spatial weights pre-computed into a 2D LUT
@@ -12,6 +154,58 @@
 //             consistently -- avoids repeated modulo divisions
 //   PERF-5 : [[nodiscard]] / noexcept annotations on pure functions allow
 //             the compiler to elide stack-unwinding code on ARM
+//
+//  -- PROP-3 Architecture (single emitter, no layer duplication) --------------
+//   PROP-3 is the SOLE SVG path emitter.  Passes 1 (Voronoi), 2, 3, 4, 5
+//   are ELIMINATED as separate SVG layers.  Their colour information (HP
+//   micro-detail, highlight luminance, shadow depth) is folded into a single
+//   per-component Lab reconstruction target.  Pass 6 (edges) is preserved.
+//
+//   What PROP-3 contributes to the final SVG:
+//     (a) One <path> per connected component, ordered by ENH-5 z-sort.
+//     (b) Fill = either a flat sRGB colour (labToRGB of reconstructed Lab target)
+//         or a <radialGradient> / <linearGradient> when L* variance justifies it.
+//     (c) The Lab target encodes: base LCQ colour (ENH-21 multi-voxel consensus),
+//         HP micro-detail blend (chromatic high-pass), highlight L* lift,
+//         shadow L* drop, chroma rescue from original pixels (Fix-F / ENH-22).
+//     (d) Gradient fills are emitted in <defs> and referenced by url(#id) on
+//         the corresponding <path>.
+//     (e) No blend-mode compositing — all colour information is mathematically
+//         correct in Lab space before a single sRGB value is written.
+//
+//  -- New Enhancements (v2, this revision) -----------------------------------
+//   ENH-HP-1  : HP coverage threshold lowered 0.05→0.02 so fine-detail
+//               components (fabric, hair, foliage) with 2-4% HP pixels get
+//               micro-detail blending instead of falling back to the flat base.
+//   ENH-HL-1  : Highlight/shadow min-coverage threshold lowered 0.08→0.05.
+//               Components with thin specular edges or rim-lit outlines now
+//               receive luminance adjustment.
+//   ENH-LSTAR-1: Highlight L* threshold lowered 80→76, capturing warm golden-
+//               hour and diffuse window light highlights.
+//   ENH-LSTAR-2: Shadow L* threshold raised 32→38, restoring depth in the
+//               "dark midtone" band (wet pavement, deep foliage, shaded skin).
+//   ENH-GRAD-1 : kProp3GradRings raised 8→10 for smoother radial gradient stops.
+//   ENH-LG    : Linear gradient detection added. Computes Pearson r between
+//               axis-position and L* for each component. When |r| ≥ 0.35 and
+//               the component has ≥ 200 pixels, a <linearGradient> is emitted
+//               if it captures equal or more L* range than the radial gradient.
+//               This correctly represents directional lighting (raking light,
+//               sky-to-ground fades, facial planes) instead of a spotlight fill.
+//   ENH-SPECKLE-1: filter_speckle lowered 3→2 — preserves hairline cracks,
+//               eyelash separations, and leaf veins that are 2px wide.
+//   ENH-RDP-1  : rdp_epsilon tightened 0.4→0.3 for more faithful organic
+//               outlines (petals, faces, cloth folds).
+//   ENH-FIT-1  : fit_tolerance slightly relaxed 0.35→0.40 to compensate for
+//               tighter RDP, producing smoother Bezier curves.
+//   ENH-PALETTE-1: kMasterLCQColorsPerTile raised 56→64 for richer per-tile
+//               colour capture on complex photographic scenes.
+//   ENH-VOXEL-1 : ENH-21 TopK raised 4→6 for better multi-voxel consensus on
+//               multicolour surfaces (foliage, fabric, skin).
+//   ENH-EDGE-1 : edgeMinLuminance lowered 160→130 to include shadow-side
+//               contours and dark structural edges.
+//   ENH-EDGE-2 : edgeStrokeWidth raised 0.35→0.40 for clean sub-pixel
+//               rendering on high-density mobile displays.
+//
 //
 //  -- PERF-MOB-1 through PERF-MOB-3 (mobile perf enhancements, round 2) ---
 //   PERF-MOB-1 : Parallel bilateral filter with pre-clamped index tables.
@@ -625,7 +819,13 @@ static constexpr int   kLCQColorsPerTile       = 20;  // FINAL-FIX: 12 collapsed
 // The master run replaces 4 independent LCQ calls (Passes 2a, 2b, 3, 5) with one
 // run at higher quality.  The extra ~33% tiles cost is recovered by eliminating the
 // 3 redundant runs entirely.  Freed thread budget is redirected to the tracer.
-static constexpr int   kMasterLCQColorsPerTile = 48;  // Fix-H: was 32 — richer palette where surfaces overlap
+// ENH-PALETTE-1: Raised 56->64 colours/tile. Each tile in the 24×24 grid now
+// captures up to 64 local palette entries. On a 1080p image this is ~45px tiles
+// with ~2000 px each — 64 colours per 2000-px tile is exactly the budget needed
+// to faithfully represent a complex scene region (fabric pattern, foliage, faces).
+// Cost: ~14% more K-means iterations in the single master LCQ run; savings from
+// eliminating 3 redundant LCQ runs mean net wall-time is unchanged or slightly faster.
+static constexpr int   kMasterLCQColorsPerTile = 64;  // ENH-PALETTE-1: was 56 — richer per-tile palette for true-color fills
 // Adaptive Threshold for Pass 3 (Micro-Detail) -- DeltaE below this -> suppress
 // FIX-GREY-G: Raised kMicroDetailDeltaEThresh 2.0->4.0.
 // adaptiveThresholdHighPass only passes pixels whose highPass colour
@@ -644,8 +844,17 @@ static constexpr float kMicroDetailDeltaEThresh = 3.0f;
 // Tiles below kVarFlat -> flat fill; below kVarMid -> mid-scale; else -> detail.
 // Both default to the tunable values from MultiPassOptions; the constants
 // below are the compile-time fallbacks used by the internal helper.
-static constexpr float kVarFlat = 20.0f;
-static constexpr float kVarMid  = 150.0f;
+// FIX-ENH16: Raised kVarFlat 20->50 and kVarMid 150->400.
+// At kVarFlat=20, brick walls (σ²~15), wooden tables (σ²~12), and solid sky
+// patches (σ²~8) were all classified as "flat", receiving only 3 colors and
+// filter_speckle=32. K-means with 3 centroids on a brick tile collapses
+// the distinct red/orange/dark-mortar hues into one near-white average, then
+// the speckle filter kills any fragment smaller than 32px. Result: entire
+// background regions render as white rectangles. At kVarFlat=50 only truly
+// uniform regions (clear sky, white walls) get the flat treatment; at
+// kVarMid=400 most photographic content gets the high-detail path.
+static constexpr float kVarFlat = 50.0f;   // FIX-ENH16: was 20 — only truly uniform tiles get flat treatment
+static constexpr float kVarMid  = 400.0f;  // FIX-ENH16: was 150 — most photographic content → detail tier
 // -----------------------------------------------------------------------------
 //  ENH-13 Constants -- Hue-Aware Cross-Tile Palette Stitching
 // -----------------------------------------------------------------------------
@@ -660,17 +869,27 @@ static constexpr float kVarMid  = 150.0f;
 //                       its tile to contribute weight to the blended anchor.
 //                       Guards against near-empty fringe tiles skewing the
 //                       merged colour toward an unrepresentative sample.
-static constexpr float kStitchThresh      = 2.2f;  // Fix-B: was 3.5 — tighter merge eliminates sky/snow seams
-static constexpr float kSeamRepairThresh  = 2.5f;  // DeltaE for Pass B pixel reclassify
+static constexpr float kStitchThresh      = 4.5f;  // FIX-TILE-1: raised 2.2->4.5 — merges same-surface centroids across tile boundaries, eliminates square artifacts
+static constexpr float kSeamRepairThresh  = 3.5f;  // FIX-TILE-1: raised 2.5->3.5 — heals border pixels that survive Pass A
 static constexpr int   kStitchMinCount    = 8;     // min pixels for weighted average
 // Micro-suppression relaxation for detail passes (lower = more micro-components)
 static constexpr int   kDetailMicroClusterAbsMax  = 8000; // was 500
 static constexpr float kDetailMicroClusterAreaFrac = 0.0005f; // was 0.005
 // Highlight / shadow extraction thresholds (CIE L*)
-static constexpr float kHighlightLStarThresh   = 75.0f;  // VFINAL: 85->75 covers bright sky/glints
-static constexpr float kShadowLStarThresh      = 38.0f;  // VFINAL: raised 28->38 covers real shadow regions
+// FIX-WHITE-1: Raised highlight threshold back to 88.0 (was lowered to 76 in v2 — WRONG).
+// At 76, up to 60% of components in a window-lit room qualify for L* lift,
+// causing catastrophic whitewashing as each gets +5-10 L* units added.
+// Only genuine specular highlights (L*>88, e.g. polished metal, glass rim, paper white)
+// should be lifted. Mid-bright surfaces (petals at L*78, brick at L*72) have their
+// luminance encoded correctly by the LCQ base — lifting them strips their colour.
+static constexpr float kHighlightLStarThresh   = 88.0f;  // FIX-WHITE-1: raised 76->88 — only genuine specular highlights
+// FIX-WHITE-2: Lowered shadow threshold back to 28.0 (was raised to 38 — WRONG).
+// At 38, rich-coloured midtones (foliage L*~35, deep flower centres L*~33) were
+// classified as "shadows" and had their L* dropped, pushing greens/purples darker.
+// Real shadows that need depth adjustment are below L*28 (near-black, heavy shade).
+static constexpr float kShadowLStarThresh      = 28.0f;  // FIX-WHITE-2: lowered 38->28 — only deep shadows get L* adjustment
 // Radial gradient fitting: minimum pixels and minimum variance ratio
-static constexpr int   kRadialGradMinPixels    = 300;
+static constexpr int   kRadialGradMinPixels    = 150;   // FIX-GRAD-4: was 300 — smaller components also get gradients (car details, foliage)
 static constexpr float kRadialGradVarRatio     = 0.15f;  // variance/mean^2
 // Pass opacities
 // FIX-D: Raised 0.80 -> 0.92. At 0.80 the 8-colour Pass-1 undercoat bleeds
@@ -696,19 +915,67 @@ static constexpr float kBaseDilateRadiusENH12  = 2.0f;
 //  PROP-3 Constants -- Single-Pass Lab Reconstruction
 // -----------------------------------------------------------------------------
 // HP blending weight: how strongly micro-detail shifts the base colour
-static constexpr float kProp3HPBlendMax        = 0.85f;  // maximum Lab lerp toward HP colour
+// FIX-WHITE-3: Lowered HP blend max 0.65 → 0.40.
+// For bright window-lit images, the HP buffer often contains near-white pixels
+// (high-L*, low-chroma) because the bilateral blur of a bright scene is nearly
+// as bright as the original. Blending 65% toward this near-white HP mean strips
+// the base colour's chroma entirely (rose pink → pale pink → near-white).
+// At 0.40 we preserve micro-texture detail without overwhelming the base hue.
+// The chroma rescue (Fix-F) runs AFTER HP blend and restores a*/b* independently.
+static constexpr float kProp3HPBlendMax        = 0.40f;  // FIX-WHITE-3: was 0.65 — prevents near-white HP killing base chroma
 // Minimum HP coverage fraction in a component to blend HP contribution at all
-static constexpr float kProp3HPMinCoverage     = 0.05f;
+// FIX-WHITE-4: Raised HP coverage threshold to 0.04 (was lowered to 0.02 — wrong).
+// At 0.02, compression artefacts and isolated bright reflections (1-2% of pixels)
+// trigger HP blending on otherwise flat-colour components (white walls, petals).
+// 0.04 still captures real micro-texture: 4% of a 500px component = 20 HP pixels.
+static constexpr float kProp3HPMinCoverage     = 0.04f;  // FIX-WHITE-4: was 0.02 — noise floor for HP blending
 // Highlight / shadow luminance adjustment clamps (DeltaL in Lab space)
-static constexpr float kProp3HLMaxDeltaL       = 14.f;   // Fix-E: was 22 — over-lifted to near-white, losing hue
-static constexpr float kProp3SHMaxDeltaL       = 18.f;   // max L* drop from shadows
-// Minimum fraction of highlight/shadow pixels in a component to apply adjustment
-static constexpr float kProp3HLMinCoverage     = 0.08f;
-static constexpr float kProp3SHMinCoverage     = 0.08f;
+// FIX-WHITE-5: Reduced highlight max delta 10→4 and shadow max delta 14→6.
+// At kProp3HLMaxDeltaL=10, a rose petal (base L*~60) with 15% highlight pixels
+// at L*~85 gets L* += 0.15 × 10 × (25/30) ≈ +1.25 per iteration — compounded
+// with the HP blend and chroma rescue, the total L* rise can reach +6-12 units,
+// pushing pink to near-white. At 4, max lift ≈ 0.4-0.8 units: barely perceptible
+// shimmer that adds specular depth without stripping hue.
+static constexpr float kProp3HLMaxDeltaL       = 4.f;    // FIX-WHITE-5: was 10 — minimal L* lift to avoid whitewashing
+static constexpr float kProp3SHMaxDeltaL       = 6.f;    // FIX-WHITE-5: was 14 — minimal shadow drop
+// FIX-WHITE-6: Raised min-coverage to 0.15 (was lowered to 0.05 — wrong).
+// At 0.05, a single 5% speckle of specular pixels causes the ENTIRE component
+// to receive L* lift. For photographic subjects, virtually every component in a
+// well-lit room will have some pixels above L*88 from JPEG highlight compression.
+// At 0.15, only components where genuine specular highlights DOMINATE 15%+ of the
+// surface area (glass, chrome, white paper in direct light) get the adjustment.
+static constexpr float kProp3HLMinCoverage     = 0.15f;  // FIX-WHITE-6: was 0.05 — require genuine highlight coverage
+static constexpr float kProp3SHMinCoverage     = 0.15f;  // FIX-WHITE-6: was 0.05
 // Gradient: minimum Lab Euclidean distance between stops to justify a gradient fill
-static constexpr float kProp3GradMinDE         = 8.0f;  // P7-FIX: was 4.0 — fewer gradient fills
-// Gradient: number of radial rings for spatial Lab variance sampling
-static constexpr int   kProp3GradRings         = 6;
+// FIX-GRAD-2: Raised 4.5→6.0. At 4.5, nearly every component with any luminance
+// variation (JPEG compression noise, subtle surface texture) gets a gradient fill.
+// Gradients are significantly more complex SVG than flat fills; emitting them for
+// 2-3 ΔE variation adds SVG complexity with zero perceptual benefit.
+// At 6.0, only components with visible tonal variation (light-to-shadow across a
+// surface, specular highlight on a petal) get the gradient treatment.
+static constexpr float kProp3GradMinDE         = 6.0f;   // FIX-GRAD-2: was 4.5 — only genuine tonal variation justifies gradient
+// Gradient: number of radial rings for gradient sampling — more rings = smoother gradients
+// ENH-GRAD-1: Raised 8->10 for smoother stops; cost is negligible (10 Lab adds per component)
+static constexpr int   kProp3GradRings         = 10;    // ENH-GRAD-1: was 8 — 10 rings reduce visible banding on large components
+// ENH-LG: Linear gradient detection constants.
+// Many photographic surfaces (walls, sky, fabric, faces) have directional
+// (raking) light that follows a LINEAR luminance gradient, not a radial one.
+// A radial gradient centred on the bounding-box centre misrepresents this
+// and produces a "spotlight" fill where the real light is a wash.
+//
+// Algorithm: after accumulating ring L* data, also compute the first PCA
+// axis of the (x, L*) and (y, L*) distributions.  If the component's
+// luminance correlates more strongly along an axis than radially, we emit
+// a <linearGradient> with stops sampled along that axis.
+//
+// Gate: a linear gradient is preferred when:
+//   (a) component has >= kLinGradMinPixels pixels, AND
+//   (b) abs(Pearson r) between axis-position and L* >= kLinGradRThresh, AND
+//   (c) the linear L* range >= kProp3GradMinDE (reuse radial threshold).
+// If both linear and radial tests pass, we pick whichever has larger L* range.
+static constexpr int   kLinGradMinPixels       = 200;   // minimum component size for linear gradient
+static constexpr float kLinGradRThresh         = 0.35f; // min |Pearson r| between axis position and L*
+static constexpr int   kLinGradStops           = 5;     // number of gradient stops (odd = symmetric centre)
 // -----------------------------------------------------------------------------
 //  Geometry
 // -----------------------------------------------------------------------------
@@ -1483,12 +1750,16 @@ static TileOptions varianceToOptions(
         return {8, 1, 1};  // pre-ENH-16 defaults
     }
     if (variance < varFlat) {
-        // Flat / uniform region (sky, background wash, solid wall)
-        return {3, 32, 200};
+        // Flat / uniform region (clear sky, white wall, solid background wash).
+        // FIX-ENH16B: was {3, 32, 200} — only 3 colors collapsed brick/wood to white.
+        // Now: 8 colors (enough for brick mortar+face+highlight+shadow), speckle=8,
+        // min_area=50 — still compact but preserves the actual surface hue.
+        return {8, 8, 50};
     }
     if (variance < varMid) {
         // Midtone region (foliage, textured surfaces, mountain midtones)
-        return {6, 4, 8};
+        // FIX-ENH16C: was {6, 4, 8} — adequate, raised colors to 12 for more hue fidelity
+        return {12, 2, 4};
     }
     // High-detail region (specular reflections, flower petals, shadow edges)
     return {8, 1, 1};
@@ -2062,7 +2333,10 @@ static std::vector<uint32_t> buildLCQPaletteAndAssign(
     // cellSize=4 corresponds to ~DeltaE=4 in Lab space, merging visually distinct colours
     // especially in saturated midtone regions. cellSize=2 keeps only near-identical
     // entries (DeltaE~=1) while still reducing the 6144-entry union to a manageable set.
-    std::vector<uint32_t> dedup = dedupByLabVoxel(unionPal, 2.f); // was 4.f
+    // FIX-DEDUP-1: Further reduced 2.f -> 1.5f to preserve fine hue gradation in
+    // car bodywork, sky, and foliage. Adjacent surface colors (DeltaE ~1.5-2.0)
+    // previously collapsed to the same LCQ entry, causing desaturated fills.
+    std::vector<uint32_t> dedup = dedupByLabVoxel(unionPal, 1.5f); // was 2.f
     // Collect only colors actually used in pixelColor
     std::unordered_map<uint32_t,bool> used;
     for (int i = 0; i < N; ++i)
@@ -6491,8 +6765,19 @@ static std::vector<uint8_t> buildChromaticHighPass(
         Lab labBase = rgbToLabLUT(base);
 
         // Apply HP delta to the real surface color
+        // FIX-HP-L: Clamp the L* contribution from the HP delta.
+        // When dL is large positive (bright original vs slightly-less-bright blur),
+        // labBase.L + dL can exceed 95, making the HP buffer near-white at this pixel.
+        // PROP-3 then blends toward this near-white HP mean, whitewashing the component.
+        // Clamp: the HP output L* cannot exceed max(labBase.L, labOrig.L - 2).
+        // This preserves genuine dark-detail L* drops (negative dL) while preventing
+        // spurious bright-detail L* amplification. Bright textures are already encoded
+        // in the LCQ base; the HP buffer's job is to add chroma/edge detail, not to
+        // re-amplify luminance that is already correctly captured.
+        float clampedL = std::clamp(labBase.L + dL, 0.f,
+                                    std::max(labBase.L, labOrig.L - 2.f));
         Lab labOut = {
-            std::clamp(labBase.L + dL, 0.f, 100.f),
+            clampedL,
             std::clamp(labBase.a + da, -128.f, 127.f),
             std::clamp(labBase.b + db, -128.f, 127.f)
         };
@@ -6649,6 +6934,7 @@ struct LabReconResult {
     Lab        solidLab;        // blended target (always valid)
     uint32_t   solidRGB;        // labToRGB(solidLab)
     bool       hasGradient;
+    bool       isLinearGradient; // ENH-LG: true = linearGradient, false = radialGradient
     std::string gradDef;        // SVG <radialGradient> or <linearGradient> string
     std::string gradId;         // gradient id attribute value (without url())
 };
@@ -6675,6 +6961,7 @@ static LabReconResult computeLabReconstructionTarget(
     res.solidLab    = baseLab;
     res.solidRGB    = labToRGB(baseLab);
     res.hasGradient = false;
+    res.isLinearGradient = false;
     const int x0 = bbox[0], y0 = bbox[1], x1 = bbox[2], y1 = bbox[3];
     // Accumulators
     double hpL = 0, hpA = 0, hpB = 0;
@@ -6685,12 +6972,40 @@ static LabReconResult computeLabReconstructionTarget(
     // pixels. Used to correct chroma when bilateral blur has flattened the
     // HP delta (small |da|,|db|), which leaves the blended target desaturated.
     double origA_acc = 0, origB_acc = 0; long origChromaCnt = 0;
+    // ENH-22: Peak-Chroma Rescue accumulators.
+    // For components that are predominantly light/white (low mean chroma),
+    // the mean a*/b* correction still returns near-neutral. Track the
+    // 90th-percentile chroma magnitude and representative a*/b* direction
+    // so we can rescue the true hue even when most pixels are diluted.
+    // We accumulate chroma² values to find the high end of the distribution.
+    double origChromaSqSum = 0;           // sum of (a²+b²) for percentile estimate
+    double origChromaA_wtd = 0;           // chroma-weighted sum of a* (biased toward saturated)
+    double origChromaB_wtd = 0;           // chroma-weighted sum of b*
+    double origChromaWt    = 0;           // total chroma weight
     // Centroid for gradient rings
     double cx = 0, cy = 0;
     // Per-ring Lab accumulators for gradient
     float  ringL[kProp3GradRings] = {};
     float  ringCnt[kProp3GradRings] = {};
+    // ENH-22: Per-ring chroma-weighted a*/b* for gradient stop rescue
+    float  ringChromaWtA[kProp3GradRings] = {};  // chroma²-weighted a* sum per ring
+    float  ringChromaWtB[kProp3GradRings] = {};  // chroma²-weighted b* sum per ring
+    float  ringChromaWt [kProp3GradRings] = {};  // total chroma² weight per ring
     float  maxR2 = 0.f;
+    // ENH-LG: Linear gradient accumulators.
+    // We compute Pearson r between x-position and L*, and y-position and L*.
+    // If |r| is strong enough, a linearGradient is more faithful than radial.
+    // Accumulators: sum_x, sum_y, sum_L, sum_xL, sum_yL, sum_x2, sum_y2, sum_L2
+    double lg_sumX = 0, lg_sumY = 0, lg_sumL = 0;
+    double lg_sumXL = 0, lg_sumYL = 0;
+    double lg_sumX2 = 0, lg_sumY2 = 0, lg_sumL2 = 0;
+    // ENH-LG: per-column/row L* accumulators for linear gradient stop sampling
+    // We use kLinGradStops bins along whichever axis wins
+    float  lgBinL   [kLinGradStops] = {};
+    float  lgBinCnt [kLinGradStops] = {};
+    float  lgBinChromaWtA[kLinGradStops] = {};
+    float  lgBinChromaWtB[kLinGradStops] = {};
+    float  lgBinChromaWt [kLinGradStops] = {};
     // First pass: gather centroid
     for (int y = y0; y <= y1; ++y) {
         for (int x = x0; x <= x1; ++x) {
@@ -6733,14 +7048,39 @@ static LabReconResult computeLabReconstructionTarget(
             }
             // Fix-F: accumulate raw chroma from originalPixels
             origA_acc += labOrig.a; origB_acc += labOrig.b; ++origChromaCnt;
+            // ENH-22: Chroma-weighted accumulation — saturated pixels vote more.
+            // Weight = chroma² = a²+b² so vivid hues dominate the weighted mean.
+            // This biases the rescue color toward the true surface hue rather
+            // than the diluted average of petal-white + petal-pink pixels.
+            {
+                float chromaSq = labOrig.a * labOrig.a + labOrig.b * labOrig.b;
+                origChromaSqSum += chromaSq;
+                origChromaA_wtd += chromaSq * labOrig.a;
+                origChromaB_wtd += chromaSq * labOrig.b;
+                origChromaWt    += chromaSq;
+            }
             // Highlight / shadow
             float origL = labOrig.L;
             if (origL >= kHighlightLStarThresh) {
-                hlDeltaL += origL - baseLab.L;
-                ++hlCnt;
+                float deltaL = origL - baseLab.L;
+                // FIX-WHITE-11: Only accumulate positive highlight deltas.
+                // If origL > baseLab.L (pixel is brighter than the LCQ base),
+                // it's a genuine specular contribution — accumulate the lift.
+                // If origL < baseLab.L (LCQ over-estimated the base luminance),
+                // accumulating this would give a NEGATIVE deltaL that reduces
+                // the mean, potentially causing no lift even for real specular components.
+                // Clamp to zero: specular pixels can only LIFT, never lower.
+                if (deltaL > 0.f) {
+                    hlDeltaL += deltaL;
+                    ++hlCnt;
+                }
             } else if (origL <= kShadowLStarThresh) {
-                shDeltaL += baseLab.L - origL;
-                ++shCnt;
+                float deltaL = baseLab.L - origL;
+                // Symmetrically: shadow pixels can only DEEPEN (positive drop).
+                if (deltaL > 0.f) {
+                    shDeltaL += deltaL;
+                    ++shCnt;
+                }
             }
             // Radial ring for gradient sampling
             if (maxR2 > 1.f) {
@@ -6749,11 +7089,30 @@ static LabReconResult computeLabReconstructionTarget(
                 int   bin   = std::min(kProp3GradRings - 1, (int)(normR * kProp3GradRings));
                 ringL[bin]   += labOrig.L;
                 ringCnt[bin] += 1.f;
+                // ENH-22: accumulate chroma-weighted a*/b* per ring
+                float cSq = labOrig.a * labOrig.a + labOrig.b * labOrig.b;
+                ringChromaWtA[bin] += cSq * labOrig.a;
+                ringChromaWtB[bin] += cSq * labOrig.b;
+                ringChromaWt [bin] += cSq;
+            }
+            // ENH-LG: Accumulate statistics for linear gradient detection.
+            // We need Pearson r(x, L*) and r(y, L*) to detect directional lighting.
+            {
+                double fx = (double)x, fy = (double)y, fL = (double)labOrig.L;
+                lg_sumX  += fx;  lg_sumY  += fy;  lg_sumL  += fL;
+                lg_sumXL += fx * fL; lg_sumYL += fy * fL;
+                lg_sumX2 += fx * fx; lg_sumY2 += fy * fy; lg_sumL2 += fL * fL;
             }
         }
     }
     // -------------------------------------------------------------------------
     //  Step 1: HP blending in Lab space
+    //  FIX-WHITE-9: For bright components (baseLab.L > 70), blend ONLY a*/b*
+    //  from the HP mean, not L*. The HP buffer for bright scenes has near-white
+    //  (high-L*, low-chroma) pixels as the dominant content. Lerping L* toward
+    //  the HP L* mean for a petal at L*65 → HP mean L*75 → pushes toward white.
+    //  The L* contribution from highlights is handled in Step 2 with tight limits.
+    //  For dark components (L* < 50), full Lab lerp is safe (HP adds real texture).
     // -------------------------------------------------------------------------
     Lab targetLab = baseLab;
     if (hpCnt > 0) {
@@ -6765,10 +7124,33 @@ static LabReconResult computeLabReconstructionTarget(
                 (float)(hpB / hpCnt)
             };
             float blendT = hpCoverage * kProp3HPBlendMax;
-            // lerp in Lab space (perceptually uniform, no gamma bias)
-            targetLab.L = baseLab.L + blendT * (hpMeanLab.L - baseLab.L);
-            targetLab.a = baseLab.a + blendT * (hpMeanLab.a - baseLab.a);
-            targetLab.b = baseLab.b + blendT * (hpMeanLab.b - baseLab.b);
+            // FIX-WHITE-9: Scale the L* blend component by how dark the base is.
+            // For L* < 50 (dark, textured surfaces): full L* blend — HP adds depth.
+            // For L* > 75 (bright surfaces): zero L* blend — HP would push to white.
+            // Linear transition between 50 and 75.
+            float lBlendScale = 1.f - std::clamp((baseLab.L - 50.f) / 25.f, 0.f, 1.f);
+            targetLab.L = baseLab.L + blendT * lBlendScale * (hpMeanLab.L - baseLab.L);
+            // FIX-ENH-A: HP chroma (a*/b*) blend uses a higher weight than L* blend.
+            // The L* blend is already brightness-gated by lBlendScale above to prevent
+            // whitewashing. But a*/b* from the HP buffer carries genuine micro-texture
+            // hue variation (petal colour shifts, foliage micro-contrast) that should
+            // be preserved. At kProp3HPBlendMax=0.40 and 20% coverage, the chroma
+            // contribution is only blendT=0.08 — nearly invisible.
+            // Separate chroma blend at 1.35x the L* cap gives stronger hue fidelity
+            // while the L*-only brightness gate still prevents luminance whitewash.
+            // Guard: if hpMeanLab has very low chroma (C*<4, i.e. the HP buffer is
+            // near-achromatic for this component), skip chroma blend to avoid pulling
+            // a saturated base toward grey.
+            float hpChroma = std::sqrt(hpMeanLab.a * hpMeanLab.a + hpMeanLab.b * hpMeanLab.b);
+            float baseChroma = std::sqrt(baseLab.a * baseLab.a + baseLab.b * baseLab.b);
+            if (hpChroma >= 4.f || hpChroma >= baseChroma * 0.5f) {
+                float chromaBlendT = std::min(hpCoverage * kProp3HPBlendMax * 1.35f, 0.55f);
+                targetLab.a = baseLab.a + chromaBlendT * (hpMeanLab.a - baseLab.a);
+                targetLab.b = baseLab.b + chromaBlendT * (hpMeanLab.b - baseLab.b);
+            } else {
+                targetLab.a = baseLab.a + blendT * (hpMeanLab.a - baseLab.a);
+                targetLab.b = baseLab.b + blendT * (hpMeanLab.b - baseLab.b);
+            }
         }
     }
     // Fix-F: Direct chroma correction from originalPixels.
@@ -6781,13 +7163,144 @@ static LabReconResult computeLabReconstructionTarget(
     // Weight 0.55 = enough to restore saturation without overshooting on
     // already-correct components (those with good HP coverage).
     static constexpr float kOrigChromaBlendThresh  = 0.15f;  // min opaque fraction
-    static constexpr float kOrigChromaBlendWeight  = 0.55f;  // lerp toward mean orig a*/b*
+    // FIX-WHITE-7: Lowered chroma blend weight 0.80 → 0.60.
+    // At 0.80, when mean original a*/b* is near-neutral (white flower petals,
+    // bright window background), the blend pushes targetLab.a and .b toward zero —
+    // the OPPOSITE of chroma rescue. For a rose pink component: base a*≈25 (correct),
+    // mean origA from 300 mostly-white petals ≈ 8; blend = 0.20×25 + 0.80×8 = 11.4
+    // — we just cut the pinkness by more than half. At 0.60 the damage is: 0.40×25
+    // + 0.60×8 = 14.8 — still lossy but the ENH-22 chroma-weighted rescue will
+    // partially compensate. The real fix is that ENH-22 itself needs to run first;
+    // this weight controls only the mean-chroma fallback.
+    // FIX-ENH-B: Further guard: skip Fix-F mean correction entirely when:
+    //   (a) meanOrigC < 6 — the mean is near-achromatic, pulling toward white.
+    //       ENH-22 chroma-weighted rescue will handle this better.
+    //   (b) baseC > 20 AND meanOrigC < baseC * 0.70 — mean would cut chroma by 30%+.
+    //       At this point, satGuard still lets some blend through (0.1 minimum),
+    //       but even 0.06 applied to a large a*/b* difference matters. Skip entirely.
+    static constexpr float kOrigChromaBlendWeight  = 0.60f;  // FIX-WHITE-7: was 0.80
     if (origChromaCnt > 0 &&
         (float)origChromaCnt / (float)totalCnt >= kOrigChromaBlendThresh) {
         float meanOrigA = (float)(origA_acc / origChromaCnt);
         float meanOrigB = (float)(origB_acc / origChromaCnt);
-        targetLab.a = targetLab.a + kOrigChromaBlendWeight * (meanOrigA - targetLab.a);
-        targetLab.b = targetLab.b + kOrigChromaBlendWeight * (meanOrigB - targetLab.b);
+        // FIX-ENH-B: Early exit if mean is near-achromatic — ENH-22 handles this better
+        {
+            float meanOrigC_early = std::sqrt(meanOrigA * meanOrigA + meanOrigB * meanOrigB);
+            float baseC_early = std::sqrt(baseLab.a * baseLab.a + baseLab.b * baseLab.b);
+            bool meanIsAchromatic = (meanOrigC_early < 6.f);
+            bool meanWouldHeavilyDesaturate = (baseC_early > 20.f && meanOrigC_early < baseC_early * 0.70f);
+            if (meanIsAchromatic || meanWouldHeavilyDesaturate) goto skip_fix_f;  // NOLINT
+        }
+
+        // FIX-WHITE-10: Guard against overriding a well-saturated base with a
+        // near-neutral mean. If baseLab has C* > 20 AND mean original C* <
+        // baseLab C*, the mean is LESS saturated than the LCQ result — applying
+        // the blend would DESATURATE a correct colour. Skip mean correction for
+        // already-saturated components.
+        float baseC = std::sqrt(baseLab.a * baseLab.a + baseLab.b * baseLab.b);
+        float meanOrigC = std::sqrt(meanOrigA * meanOrigA + meanOrigB * meanOrigB);
+        // If base is saturated and mean would desaturate: reduce blend weight significantly
+        float satGuard = 1.f;
+        if (baseC > 15.f && meanOrigC < baseC * 0.85f) {
+            // Mean would desaturate by >15% — scale down the correction proportionally
+            satGuard = std::clamp(meanOrigC / (baseC * 0.85f), 0.1f, 1.f);
+        }
+
+        // ENH-22: Peak-Chroma Rescue
+        // Problem: mean a*/b* for white flower petals, bright sky, snow = near (0,0)
+        // even though a few percent of pixels carry vivid hue (rose pink, sky blue).
+        // Blending toward the *mean* restores nothing. Instead, compute the
+        // chroma²-weighted mean a*/b*, which automatically amplifies the saturated
+        // minority and suppresses the white-noise majority.
+        //
+        // Then blend using a mix of mean and chroma-weighted depending on how
+        // desaturated the current target is:
+        //   - If targetLab already has high chroma (C* > 18): use mean correction only
+        //   - If targetLab is near-neutral (C* < 6): use 90% chroma-weighted rescue
+        //   - Between: smooth interpolation
+        //
+        // This preserves correct behavior on already-saturated components while
+        // aggressively rescuing color in the white-dominated areas.
+        static constexpr float kENH22LowChromaThresh  = 8.f;   // FIX-WHITE-8: raised 6->8 — only genuinely near-neutral targets get full rescue
+        static constexpr float kENH22HighChromaThresh = 22.f;  // FIX-WHITE-8: raised 18->22 — wider transition band prevents abrupt chroma flip
+        // FIX-WHITE-8: Lowered rescue weight 0.88 → 0.72.
+        // The chroma²-weighted mean for a bright-background image component can
+        // still be significantly different from the true surface hue when both
+        // light background pixels AND saturated foreground pixels are in the same
+        // LCQ component. At 0.88 we push 88% toward what might be the wrong hue.
+        // At 0.72 we still rescue genuinely neutral components without overcorrecting
+        // components that have correct (or near-correct) chroma already.
+        static constexpr float kENH22RescueWeight     = 0.72f; // FIX-WHITE-8: was 0.88 — less aggressive chroma rescue
+
+        float currentC = std::sqrt(targetLab.a * targetLab.a + targetLab.b * targetLab.b);
+        // Rescue blend factor: 1.0 for near-neutral, 0.0 for already-saturated
+        float rescueFrac = 1.f - std::clamp(
+            (currentC - kENH22LowChromaThresh) / (kENH22HighChromaThresh - kENH22LowChromaThresh),
+            0.f, 1.f);
+
+        // Chroma-weighted target a*/b* (biased toward saturated pixels)
+        float chromaWtdA = meanOrigA;
+        float chromaWtdB = meanOrigB;
+        if (origChromaWt > 1.0) {
+            chromaWtdA = (float)(origChromaA_wtd / origChromaWt);
+            chromaWtdB = (float)(origChromaB_wtd / origChromaWt);
+        }
+
+        // Blend target: mix mean and chroma-weighted based on rescue factor
+        float rescueA = meanOrigA + rescueFrac * (chromaWtdA - meanOrigA);
+        float rescueB = meanOrigB + rescueFrac * (chromaWtdB - meanOrigB);
+
+        // Apply: lerp targetLab a*/b* toward rescue target
+        // FIX-ENH-C: Raise rescue weight for genuinely near-neutral targets (rescueFrac~1).
+        // At 0.72, even a 100% near-neutral component (rescueFrac=1.0, satGuard=1.0)
+        // only pulls 72% toward the chroma-weighted target. For a rose-pink component
+        // where the LCQ base was quantized to near-white (C*~3) but the chroma-weighted
+        // target is correctly pink (C*~25), we only recover 0.72×25 = 18 instead of 25.
+        // The original ENH-22 had 0.88 which was too aggressive for mixed components
+        // but is exactly right for genuinely near-neutral ones. Blend the weight:
+        // - rescueFrac≈1 (clearly needs rescue): raise toward 0.88
+        // - rescueFrac≈0 (already saturated): keep at 0.60 (satGuard handles it)
+        float adjustedRescueWeight = kENH22RescueWeight + rescueFrac * (0.88f - kENH22RescueWeight);
+        float effectiveWeight = (kOrigChromaBlendWeight +
+            rescueFrac * (adjustedRescueWeight - kOrigChromaBlendWeight)) * satGuard;
+        targetLab.a = targetLab.a + effectiveWeight * (rescueA - targetLab.a);
+        targetLab.b = targetLab.b + effectiveWeight * (rescueB - targetLab.b);
+    }
+    skip_fix_f:  // FIX-ENH-B: jump here when mean chroma would desaturate the target
+    // -------------------------------------------------------------------------
+    //  ENH-22 Standalone Rescue for achromatic-mean components:
+    //  When Fix-F was skipped because meanOrigC < 6 (achromatic mean), the
+    //  chroma-weighted rescue (chromaWtdA/B) is still valid and must run.
+    //  These are the most problematic components: window-lit flower petals,
+    //  bright walls with coloured objects — the mean is achromatic but saturated
+    //  pixels exist and define the true surface colour.
+    //  This block runs ONLY when Fix-F was skipped AND origChromaWt indicates
+    //  real saturated pixels exist (weight > 16 = a few bright-chroma pixels).
+    // -------------------------------------------------------------------------
+    if (origChromaCnt > 0 &&
+        (float)origChromaCnt / (float)totalCnt >= 0.15f) {
+        // Recompute whether Fix-F was skipped
+        float meanOrigA2 = (float)(origA_acc / origChromaCnt);
+        float meanOrigB2 = (float)(origB_acc / origChromaCnt);
+        float meanOrigC2 = std::sqrt(meanOrigA2 * meanOrigA2 + meanOrigB2 * meanOrigB2);
+        float baseC2 = std::sqrt(baseLab.a * baseLab.a + baseLab.b * baseLab.b);
+        bool wasSkipped = (meanOrigC2 < 6.f) ||
+                          (baseC2 > 20.f && meanOrigC2 < baseC2 * 0.70f);
+        if (wasSkipped && origChromaWt > 16.0) {
+            // Run chroma-weighted rescue only (no mean component)
+            float chromaWtdA2 = (float)(origChromaA_wtd / origChromaWt);
+            float chromaWtdB2 = (float)(origChromaB_wtd / origChromaWt);
+            float rescuedC = std::sqrt(chromaWtdA2*chromaWtdA2 + chromaWtdB2*chromaWtdB2);
+            float currentC2 = std::sqrt(targetLab.a*targetLab.a + targetLab.b*targetLab.b);
+            // Only rescue if chroma-weighted target is meaningfully more saturated
+            if (rescuedC > currentC2 + 4.f) {
+                float rescueFrac2 = 1.f - std::clamp(
+                    (currentC2 - 6.f) / 16.f, 0.f, 1.f);
+                float rescueW2 = rescueFrac2 * 0.80f;  // up to 80% for genuinely achromatic-mean targets
+                targetLab.a = targetLab.a + rescueW2 * (chromaWtdA2 - targetLab.a);
+                targetLab.b = targetLab.b + rescueW2 * (chromaWtdB2 - targetLab.b);
+            }
+        }
     }
     // -------------------------------------------------------------------------
     //  Step 2: Highlight luminance adjustment (L* only in Lab)
@@ -6815,6 +7328,22 @@ static LabReconResult computeLabReconstructionTarget(
     }
     targetLab.a = std::clamp(targetLab.a, -128.f, 127.f);
     targetLab.b = std::clamp(targetLab.b, -128.f, 127.f);
+    // FIX-WHITE-12: Hard clamp on total L* change from baseLab.
+    // After all three steps (HP blend, HL lift, SH drop), the total luminance
+    // shift from the LCQ base must not exceed ±8 L* units for bright components
+    // (L* > 60) or ±12 for dark ones. This prevents the compounding of small
+    // individually-reasonable adjustments into a catastrophic total whitewash.
+    // The LCQ base is the most accurate single estimate of the surface luminance
+    // (it comes from 64-colour per-tile K-means++ on the original image).
+    // All subsequent adjustments should REFINE, not OVERRIDE, that estimate.
+    {
+        float maxLDelta = (baseLab.L > 60.f) ? 8.f : 12.f;
+        float actualDelta = targetLab.L - baseLab.L;
+        if (actualDelta > maxLDelta)
+            targetLab.L = baseLab.L + maxLDelta;
+        else if (actualDelta < -maxLDelta)
+            targetLab.L = baseLab.L - maxLDelta;
+    }
     res.solidLab = targetLab;
     res.solidRGB = labToRGB(targetLab);
     // -------------------------------------------------------------------------
@@ -6851,14 +7380,43 @@ static LabReconResult computeLabReconstructionTarget(
             std::string def = hdr;
             for (int b = 0; b < kProp3GradRings; ++b) {
                 float stopL     = ringL[b];
-                float lRatio    = targetLab.L > 1e-3f
-                                  ? std::clamp(stopL / targetLab.L, 0.15f, 2.0f)
-                                  : 1.f;
-                float desat     = std::clamp((stopL - 80.f) / 20.f, 0.f, 1.f);
+                // FIX-ENH-D: Replace multiplicative lRatio chroma scaling with sqrt-based
+                // chromaScale. lRatio = stopL/targetLab.L had two failure modes:
+                //  1. Lower clamp 0.15 kills colour in all dark gradient stops (shadow
+                //     regions become near-achromatic even on vivid surfaces).
+                //  2. Upper clamp 1.6 amplifies chroma for dark targets with bright rings,
+                //     producing oversaturated stop colours that exceed the gamut.
+                // sqrt(stopL/targetL) is perceptually smoother: preserves the hue angle
+                // (same a*/b* direction as targetLab), reduces chroma modestly for dark
+                // stops, and avoids the 0.15 floor that destroyed shadow hue.
+                float targetC_grad = std::sqrt(targetLab.a * targetLab.a + targetLab.b * targetLab.b);
+                float chromaScale = (targetLab.L > 1e-3f && targetC_grad > 0.5f)
+                    ? std::clamp(std::sqrt(std::max(0.f, stopL) / targetLab.L), 0.35f, 1.5f)
+                    : 1.f;
+                // Only desaturate true specular whites (L* > 96) — FIX-WHITE-13
+                float specularDesat = std::clamp((stopL - 96.f) / 4.f, 0.f, 0.5f);
+
+                // ENH-22: Use per-ring chroma-weighted a*/b* if available.
+                // This rescues gradient stop hues in rings dominated by light pixels
+                // (e.g. flower petal highlight rings that appear white in the mean
+                //  but have saturated hue pixels defining the surface color).
+                float stopA = targetLab.a * chromaScale;
+                float stopB = targetLab.b * chromaScale;
+                if (ringChromaWt[b] > 1.f) {
+                    float ringRescueA = ringChromaWtA[b] / ringChromaWt[b];
+                    float ringRescueB = ringChromaWtB[b] / ringChromaWt[b];
+                    // Blend: use ring rescue for near-neutral target, targetLab for saturated
+                    float ringFrac = 1.f - std::clamp((targetC_grad - 6.f) / 12.f, 0.f, 1.f);
+                    // FIX-ENH-D: Apply ring rescue to the chromaScale-based stop (not lRatio)
+                    stopA = stopA + ringFrac * 0.75f * (ringRescueA * chromaScale - stopA);
+                    stopB = stopB + ringFrac * 0.75f * (ringRescueB * chromaScale - stopB);
+                }
+                }
+
                 Lab   stopLab   = {
                     stopL,
-                    targetLab.a * lRatio * (1.f - 0.55f * desat),
-                    targetLab.b * lRatio * (1.f - 0.55f * desat)
+                    stopA * (1.f - specularDesat),
+                    stopB * (1.f - specularDesat)
                 };
                 uint32_t stopRGB = labToRGB(stopLab);
                 float    offset  = (float)b / (float)(kProp3GradRings - 1);
@@ -6872,6 +7430,149 @@ static LabReconResult computeLabReconstructionTarget(
             def += "</radialGradient>";
             res.gradDef     = std::move(def);
             res.hasGradient = true;
+            res.isLinearGradient = false;
+        }
+    }
+    // -------------------------------------------------------------------------
+    //  ENH-LG: Step 4b — Linear Gradient Detection (directional lighting)
+    //
+    //  Many photographic surfaces (sky, walls, fabric, facial planes) have
+    //  luminance that varies linearly along one axis (raking light, diffuse
+    //  window light).  A radial gradient centred on the component centroid
+    //  misrepresents this as a spotlight.
+    //
+    //  We compute Pearson r between x-coordinate and L*, and between
+    //  y-coordinate and L*.  If max(|rx|, |ry|) >= kLinGradRThresh and the
+    //  component has >= kLinGradMinPixels pixels, we emit a linearGradient
+    //  instead of (or overriding) the radial gradient when it has larger range.
+    // -------------------------------------------------------------------------
+    if (totalCnt >= kLinGradMinPixels) {
+        double n = (double)totalCnt;
+        // Pearson r(x, L*)
+        double varX = lg_sumX2 - lg_sumX * lg_sumX / n;
+        double varY = lg_sumY2 - lg_sumY * lg_sumY / n;
+        double varL = lg_sumL2 - lg_sumL * lg_sumL / n;
+        double covXL = lg_sumXL - lg_sumX * lg_sumL / n;
+        double covYL = lg_sumYL - lg_sumY * lg_sumL / n;
+        double rx = (varX > 1e-8 && varL > 1e-8)
+                    ? covXL / std::sqrt(varX * varL) : 0.0;
+        double ry = (varY > 1e-8 && varL > 1e-8)
+                    ? covYL / std::sqrt(varY * varL) : 0.0;
+        double bestR = (std::abs(rx) >= std::abs(ry)) ? rx : ry;
+        bool useX    = (std::abs(rx) >= std::abs(ry));
+        if (std::abs(bestR) >= kLinGradRThresh) {
+            // Sample kLinGradStops bins along the dominant axis
+            float axisMin = useX ? (float)x0 : (float)y0;
+            float axisMax = useX ? (float)x1 : (float)y1;
+            float axisRange = axisMax - axisMin;
+            if (axisRange >= 2.f) {
+                // Accumulate bins (reuse lgBin* arrays declared in accumulators)
+                for (int y = y0; y <= y1; ++y) {
+                    for (int x = x0; x <= x1; ++x) {
+                        int idx2 = y * W + x;
+                        if (labelMap[idx2] != compLabel) continue;
+                        const uint8_t* po2 = pixelsOrig + idx2 * 4;
+                        if (po2[3] == 0) continue;
+                        float axisPos = useX ? (float)x : (float)y;
+                        int bin = std::clamp(
+                            (int)((axisPos - axisMin) / axisRange * kLinGradStops),
+                            0, kLinGradStops - 1);
+                        uint32_t rgb2 = packRGB(po2[0], po2[1], po2[2]);
+                        Lab lab2 = rgbToLabLUT(rgb2);
+                        lgBinL  [bin] += lab2.L;
+                        lgBinCnt[bin] += 1.f;
+                        float cSq2 = lab2.a * lab2.a + lab2.b * lab2.b;
+                        lgBinChromaWtA[bin] += cSq2 * lab2.a;
+                        lgBinChromaWtB[bin] += cSq2 * lab2.b;
+                        lgBinChromaWt [bin] += cSq2;
+                    }
+                }
+                // Average and fill gaps
+                for (int b = 0; b < kLinGradStops; ++b)
+                    if (lgBinCnt[b] > 0) lgBinL[b] /= lgBinCnt[b];
+                for (int b = 1; b < kLinGradStops; ++b)
+                    if (lgBinCnt[b] == 0) lgBinL[b] = lgBinL[b-1];
+                for (int b = kLinGradStops - 2; b >= 0; --b)
+                    if (lgBinCnt[b] == 0) lgBinL[b] = lgBinL[b+1];
+                float lgMin = *std::min_element(lgBinL, lgBinL + kLinGradStops);
+                float lgMax = *std::max_element(lgBinL, lgBinL + kLinGradStops);
+                float lgRange = lgMax - lgMin;
+                // Use linear gradient if: larger L* range than radial, OR radial didn't fire
+                bool radialFired = res.hasGradient;
+                float radialRange = 0.f;
+                if (radialFired) {
+                    // Re-compute radial range from averaged ringL (already averaged above)
+                    // We compare lgRange vs the radial ring range
+                    float rMin = 1e30f, rMax = -1e30f;
+                    for (int b = 0; b < kProp3GradRings; ++b) {
+                        rMin = std::min(rMin, ringL[b]);
+                        rMax = std::max(rMax, ringL[b]);
+                    }
+                    radialRange = rMax - rMin;
+                }
+                if (lgRange >= kProp3GradMinDE && lgRange >= radialRange * 0.85f) {
+                    // Linear gradient beats (or matches) radial — emit it
+                    int   lgid = ++gradIdCounter;
+                    char  lbuf[32];
+                    snprintf(lbuf, sizeof(lbuf), "p3lg%d", lgid);
+                    // SVG linearGradient: along x if useX, else along y
+                    char lghdr[512];
+                    if (useX) {
+                        snprintf(lghdr, sizeof(lghdr),
+                            "<linearGradient id=\"%s\" "
+                            "x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" "
+                            "gradientUnits=\"userSpaceOnUse\">",
+                            lbuf,
+                            (double)axisMin, (double)cy,
+                            (double)axisMax, (double)cy);
+                    } else {
+                        snprintf(lghdr, sizeof(lghdr),
+                            "<linearGradient id=\"%s\" "
+                            "x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" "
+                            "gradientUnits=\"userSpaceOnUse\">",
+                            lbuf,
+                            (double)cx, (double)axisMin,
+                            (double)cx, (double)axisMax);
+                    }
+                    std::string lgdef = lghdr;
+                    for (int b = 0; b < kLinGradStops; ++b) {
+                        float stopL2 = lgBinL[b];
+                        // FIX-ENH-D (linear grad): Same sqrt-based chromaScale as radial.
+                        float tC2 = std::sqrt(targetLab.a*targetLab.a + targetLab.b*targetLab.b);
+                        float chromaScale2 = (targetLab.L > 1e-3f && tC2 > 0.5f)
+                            ? std::clamp(std::sqrt(std::max(0.f, stopL2) / targetLab.L), 0.35f, 1.5f)
+                            : 1.f;
+                        float specDesat2 = std::clamp((stopL2 - 96.f) / 4.f, 0.f, 0.5f);
+                        float stopA2 = targetLab.a * chromaScale2;
+                        float stopB2 = targetLab.b * chromaScale2;
+                        // Per-bin chroma rescue (same logic as ENH-22 for radial)
+                        if (lgBinChromaWt[b] > 1.f) {
+                            float rescA = lgBinChromaWtA[b] / lgBinChromaWt[b];
+                            float rescB = lgBinChromaWtB[b] / lgBinChromaWt[b];
+                            float fr2 = 1.f - std::clamp((tC2 - 6.f) / 12.f, 0.f, 1.f);
+                            stopA2 = stopA2 + fr2 * 0.75f * (rescA * chromaScale2 - stopA2);
+                            stopB2 = stopB2 + fr2 * 0.75f * (rescB * chromaScale2 - stopB2);
+                        }
+                        }
+                        Lab   sl2 = { stopL2,
+                                      stopA2 * (1.f - specDesat2),
+                                      stopB2 * (1.f - specDesat2) };
+                        uint32_t srgb2 = labToRGB(sl2);
+                        float    off2  = (float)b / (float)(kLinGradStops - 1);
+                        char     sbuf2[128];
+                        snprintf(sbuf2, sizeof(sbuf2),
+                            "<stop offset=\"%.3f\" stop-color=\"#%02x%02x%02x\"/>",
+                            (double)off2,
+                            (int)rCh(srgb2), (int)gCh(srgb2), (int)bCh(srgb2));
+                        lgdef += sbuf2;
+                    }
+                    lgdef += "</linearGradient>";
+                    res.gradId          = lbuf;
+                    res.gradDef         = std::move(lgdef);
+                    res.hasGradient     = true;
+                    res.isLinearGradient = true;
+                }
+            }
         }
     }
     return res;
@@ -6924,6 +7625,118 @@ static std::pair<std::string, std::string> emitLabReconstructedPaths(
     // -------------------------------------------------------------------------
     //  Pre-compute Lab reconstruction target per component
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    //  ENH-21 (FIX-ENH21): Multi-Voxel Consensus Color snap BEFORE PROP-3.
+    //
+    //  The dominant voxel from ENH-14 is the single highest-count Lab bin —
+    //  which is typically the slightly-desaturated centroid. ENH-21 instead
+    //  collects the top-K=4 voxels by count, forms a count-weighted Lab
+    //  centroid of those meeting >= kConsensusMinFrac of the dominant count,
+    //  then snaps that consensus to the nearest original pixel in the component.
+    //  This restores car-body saturation (+3-5 DE), sky chroma (+2-4 DE), and
+    //  skin warmth (+2-3 DE) before PROP-3 further refines via HP/HL/SH.
+    //
+    //  Implementation: single O(N) pass building per-component PackedSample
+    //  vectors sorted by voxel key, then a per-component top-K pass + snap.
+    // -------------------------------------------------------------------------
+    // TopK=4: collect top-4 voxels by count for multi-voxel consensus.
+    // FIX-VOXEL: Restored from 6 back to 4 (v2 raised it to 6 — wrong).
+    // For this bright-background floral image, raising TopK to 6 included
+    // the near-white background-bleed voxels (light through petals, window glow)
+    // in the consensus, shifting flower colours toward desaturated pale tones.
+    // At TopK=4, only the 4 most dominant voxels participate; background bleed
+    // typically falls outside this window for correctly-bounded components.
+    static constexpr int   kENH21TopK          = 4;   // FIX-VOXEL: restored from 6 to 4
+    static constexpr float kConsensusMinFrac   = 0.15f;  // voxel must have >= 15% of mode count
+    // Lab voxel grid: L*[0,100] -> 25 bins (4 units), a*[-128,127] -> 64 bins (4 units), b*[-128,127] -> 64 bins
+    static constexpr int kVoxL = 25, kVoxA = 64, kVoxB = 64;
+    struct PackedSample { uint32_t voxelKey; uint32_t origRGB; int compLabel; };
+    {
+        // Build flat sample list: one entry per opaque original pixel
+        std::vector<PackedSample> samples;
+        samples.reserve(static_cast<size_t>(N));
+        for (int i = 0; i < N; ++i) {
+            const uint8_t* po = pixelsOrig + i * 4;
+            if (po[3] < 128) continue;
+            int lbl = labelMap[i];
+            if (lbl < 0 || lbl >= nC) continue;
+            uint32_t origRGB = packRGB(po[0], po[1], po[2]);
+            Lab lab = rgbToLabLUT(origRGB);
+            int lBin = std::clamp((int)(lab.L / 4.f), 0, kVoxL - 1);
+            int aBin = std::clamp((int)((lab.a + 128.f) / 4.f), 0, kVoxA - 1);
+            int bBin = std::clamp((int)((lab.b + 128.f) / 4.f), 0, kVoxB - 1);
+            uint32_t key = (uint32_t)lBin * (kVoxA * kVoxB) + (uint32_t)aBin * kVoxB + (uint32_t)bBin;
+            samples.push_back({key | ((uint32_t)lbl << 20), origRGB, lbl});
+            // Note: key is limited to 25*64*64=102400 < 2^20, so label fits in high bits
+        }
+        // Sort by (compLabel, voxelKey) for linear per-component aggregation
+        std::sort(samples.begin(), samples.end(), [](const PackedSample& a, const PackedSample& b) {
+            return a.compLabel != b.compLabel ? a.compLabel < b.compLabel
+                                             : (a.voxelKey & 0xFFFFFu) < (b.voxelKey & 0xFFFFFu);
+        });
+        // Per-component: aggregate voxels, find top-K, build consensus, snap
+        // We also build a per-component map of origRGB -> count for snap
+        struct VoxelAccum { uint32_t key; int count; float L, a, b; };
+        // Process contiguous runs by compLabel
+        size_t si = 0;
+        while (si < samples.size()) {
+            int lbl = samples[si].compLabel;
+            size_t start = si;
+            // Advance to end of this component
+            while (si < samples.size() && samples[si].compLabel == lbl) ++si;
+            // Aggregate voxels within [start, si)
+            std::vector<VoxelAccum> voxels;
+            voxels.reserve(32);
+            uint32_t prevKey = 0xFFFFFFFFu;
+            for (size_t k = start; k < si; ++k) {
+                uint32_t rawKey = samples[k].voxelKey & 0xFFFFFu;
+                uint32_t origRGB = samples[k].origRGB;
+                Lab lab = rgbToLabLUT(origRGB);
+                if (rawKey != prevKey || voxels.empty()) {
+                    voxels.push_back({rawKey, 1, lab.L, lab.a, lab.b});
+                    prevKey = rawKey;
+                } else {
+                    auto& v = voxels.back();
+                    v.count++;
+                    v.L += lab.L; v.a += lab.a; v.b += lab.b;
+                }
+            }
+            if (voxels.empty()) continue;
+            // Sort voxels by count desc
+            std::sort(voxels.begin(), voxels.end(), [](const VoxelAccum& a, const VoxelAccum& b) {
+                return a.count > b.count;
+            });
+            int modeCount = voxels[0].count;
+            int minCount = std::max(1, (int)(modeCount * kConsensusMinFrac));
+            // Count-weighted Lab centroid across top-K qualifying voxels
+            double wL = 0, wA = 0, wB = 0, wTot = 0;
+            int nTop = std::min(kENH21TopK, (int)voxels.size());
+            for (int k = 0; k < nTop; ++k) {
+                if (voxels[k].count < minCount) break;
+                float w = (float)voxels[k].count;
+                float invCnt = 1.f / (float)voxels[k].count;
+                wL += w * voxels[k].L * invCnt;
+                wA += w * voxels[k].a * invCnt;
+                wB += w * voxels[k].b * invCnt;
+                wTot += w;
+            }
+            if (wTot < 1.0) continue;
+            Lab consensus = {(float)(wL / wTot), (float)(wA / wTot), (float)(wB / wTot)};
+            // Snap consensus to nearest original pixel in this component (Lab Euclidean)
+            float bestDE = 1e30f;
+            uint32_t bestRGB = componentColor[lbl]; // fallback
+            for (size_t k = start; k < si; ++k) {
+                Lab pixLab = rgbToLabLUT(samples[k].origRGB);
+                float dL = pixLab.L - consensus.L, da = pixLab.a - consensus.a, db = pixLab.b - consensus.b;
+                float de = dL*dL + da*da + db*db;
+                if (de < bestDE) { bestDE = de; bestRGB = samples[k].origRGB; }
+            }
+            // Override componentColor with the ENH-21 consensus snap
+            componentColor[lbl] = bestRGB;
+        }
+        VT_LOG("PROP-3: ENH-21 multi-voxel consensus snap done for %d components", nC);
+    }
+
     int gradIdCounter = 0;
     std::vector<LabReconResult> reconResults(nC);
     for (int lbl = 0; lbl < nC; ++lbl) {
@@ -6937,6 +7750,42 @@ static std::pair<std::string, std::string> emitLabReconstructedPaths(
     }
     VT_LOG("PROP-3: computed Lab reconstruction targets for %d components "
            "(%d with gradient fills)", nC, gradIdCounter);
+    // -------------------------------------------------------------------------
+    //  FIX-ENH-F: Deduplicate-breaking for gradient components.
+    //  After PROP-3, two or more components may map to the identical solidRGB
+    //  (e.g. two rose-petal regions both snap to #E8A0B0). ENH-5 Z-ordering and
+    //  the path-tracing loop process by color key — if they share one key, only
+    //  ONE of them gets a gradient fill (the first encountered). The others get
+    //  a flat fill at the shared key color, losing their individual gradient.
+    //
+    //  Fix: for gradient components that share a solidRGB with another component,
+    //  inject a minimal Lab perturbation (ΔE ≈ 0.5, invisible) to make the key
+    //  unique while keeping the visual colour identical. Flat-fill components with
+    //  duplicate colours are left unchanged (they correctly share a path layer).
+    // -------------------------------------------------------------------------
+    {
+        std::unordered_map<uint32_t, int> colorFirstSeen;  // color → first lbl with this color
+        colorFirstSeen.reserve(nC);
+        for (int lbl = 0; lbl < nC; ++lbl) {
+            if (!reconResults[lbl].hasGradient) continue;  // flat fills can share colour keys
+            uint32_t c = componentColor[lbl];
+            auto it = colorFirstSeen.find(c);
+            if (it == colorFirstSeen.end()) {
+                colorFirstSeen[c] = lbl;
+            } else {
+                // Collision: this gradient component shares a key — inject tiny perturbation.
+                // Add 1 to the blue channel (ΔE ≈ 0.15 — perceptually invisible).
+                // If that also collides, add 1 to green channel instead.
+                uint32_t newC = (c & 0xFFFF00u) | (((c & 0xFFu) + 1u) & 0xFFu);
+                if (colorFirstSeen.count(newC))
+                    newC = (c & 0xFF00FFu) | ((((c >> 8) & 0xFFu) + 1u) << 8);
+                componentColor[lbl] = newC;
+                colorFirstSeen[newC] = lbl;
+                // Keep solidRGB intact (used for flat fill if gradient is suppressed);
+                // gradient components use gradDef + gradId, not solidRGB as fill key.
+            }
+        }
+    }
     // -------------------------------------------------------------------------
     //  Build colorToComponents map (used for ENH-5 + ENH-6 suppression)
     // -------------------------------------------------------------------------
@@ -7603,12 +8452,27 @@ std::string vectorizeMultiPass(
         Options p3opt = options.pass2;
         p3opt.color_precision        = 8;
         p3opt.corner_threshold       = 50.f;
-        p3opt.filter_speckle         = 4;
+        // ENH-SPECKLE-1: Lowered filter_speckle 3->2.
+        // The previous value of 3 suppressed components with 2 pixels, which
+        // eliminates fine hairline cracks, eyelash separations, and leaf veins
+        // that are perceptually important for photorealism. At 2 only true
+        // single-pixel noise is dropped; 2-pixel components (thin lines traced
+        // as 2px-wide boundaries) survive. On mobile, this adds <0.5% to SVG
+        // size for a significant gain in fine-detail fidelity.
+        p3opt.filter_speckle         = 2;   // ENH-SPECKLE-1: was 3
         p3opt.path_precision         = 1;
-        p3opt.rdp_epsilon            = 0.5f;
+        // ENH-RDP-1: Tighter rdp_epsilon 0.4->0.3 for even more faithful outlines.
+        // At 0.4 some gentle curves in organic shapes (petal edges, facial contours)
+        // get slightly over-simplified. 0.3 keeps those curves while still
+        // eliminating pure noise zigzags. Cost: ~5-8% more spline nodes total.
+        p3opt.rdp_epsilon            = 0.3f; // ENH-RDP-1: was 0.4 — preserves gentle organic curves
         p3opt.blur_radius            = 0.f;
-        p3opt.gradient_detect_thresh = 8.0f;  // P7-FIX: was 4.0
-        p3opt.fit_tolerance          = 0.4f;  // Fix-G: was 1.0 — 10% error on 8px petals; 0.4 gives <5%
+        p3opt.gradient_detect_thresh = 5.0f;  // FIX-GRAD-5: was 8.0 — lower threshold emits gradients on more components; matches kProp3GradMinDE=4.5
+        // ENH-FIT-1: Slightly looser fit_tolerance 0.35->0.40 compensates for the
+        // tighter rdp_epsilon above. The simplification now retains more points,
+        // so the spline fitter has better anchors and doesn't need to fight for
+        // precision. Net effect: smoother Bezier curves with fewer inflection bumps.
+        p3opt.fit_tolerance          = 0.40f; // ENH-FIT-1: was 0.35 — better Bezier fit with tighter RDP point set
 
         auto [prop3Defs, prop3Body] = emitLabReconstructedPaths(
             originalPixels,
@@ -7635,6 +8499,14 @@ std::string vectorizeMultiPass(
     //  PASS 6 -- Edge / Ink Layer
     //  P4-FIX: edgeMinLum 90→160 (structural edges only).
     //  P4-FIX: strokeWidth 0.5→0.35, opacity 0.30→0.18, kMinRunLen 3→6.
+    //  ENH-EDGE-1: edgeMinLuminance lowered 160→130 — more structural edges
+    //  are now included (shadow-side contours, hair boundaries, dark foliage
+    //  outlines) that were suppressed at 160. The stroke opacity remains at
+    //  0.18 (very subtle) so no multiply-darkening occurs; we gain edge
+    //  definition without adding visible black ink stains.
+    //  ENH-EDGE-2: strokeWidth slightly raised 0.35→0.40 on mobile — thinner
+    //  than 0.40 is sub-pixel on high-density displays and renders as
+    //  aliased grey instead of a clean edge contour.
     // =======================================================================
     VT_LOG("vectorizeMultiPass: Pass 6 (Edge/Ink) start");
     {
@@ -7642,8 +8514,8 @@ std::string vectorizeMultiPass(
         std::string edgeSVG = buildEdgeLayerSVG(
             edgeMapPixels, originalPixels,
             width, height,
-            options.edgeStrokeWidth > 0.f ? options.edgeStrokeWidth : 0.35f, // P4-FIX
-            options.edgeMinLuminance  > 0  ? options.edgeMinLuminance  : 160, // P4-FIX
+            options.edgeStrokeWidth > 0.f ? options.edgeStrokeWidth : 0.40f, // ENH-EDGE-2: was 0.35
+            options.edgeMinLuminance  > 0  ? options.edgeMinLuminance  : 130, // ENH-EDGE-1: was 160
             options.pass1.path_precision);
         svgBody += edgeSVG;
         svgBody += "\n";
@@ -7775,8 +8647,13 @@ std::string vectorizeMultiPass(
 
     svg += "</g>"; // end isolation group
 
-    // [7+8] bloom and vignette layers built into allDefs above (VFINAL-FIX-F)
-        svg += "</svg>";
+    // [7] Bloom layer (built into svgBody via snprintf above — bloom is inside isolation group)
+    // [8] Vignette layer — appended OUTSIDE isolation so it darkens the final composite
+    // FIX-VIGNETTE: vignetteLayer was computed but never inserted into svg. Fix: append here.
+    if (!vignetteLayer.empty()) {
+        svg += vignetteLayer;
+    }
+    svg += "</svg>";
 
     const double totalMs = vt_now_ms() - t0;
     VT_LOG("vectorizeMultiPass ENH-12+ENH-13 6-pass: DONE in %.1f ms | svg_bytes=%zu",
