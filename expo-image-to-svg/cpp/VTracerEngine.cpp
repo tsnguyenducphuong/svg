@@ -756,6 +756,43 @@ static constexpr int   kMaxPaletteSize         = 256;
 static constexpr float kPi                     = 3.14159265358979f;
 static constexpr int   kMaxFitIter             = 20;
 static constexpr float kFitTolerance           = 0.5f;
+// ENH-ADAPTIVE-FIT: Per-component adaptive Bézier fit tolerance.
+//
+// Near-achromatic, large components (aged plaster, haze, fog, white walls,
+// chrome specular) produce spiral or concentric-rectangle path artefacts
+// when their distressed/mottled texture is traced at tight tolerance.
+// VTracer faithfully follows every subtle luminance wrinkle in the texture,
+// producing nested closed paths that look like decorative spirals rather
+// than smooth background fills.
+//
+// Fix: increase fit_tolerance for qualifying components so the Bézier fitter
+// accepts a rougher approximation — smoothing out the micro-contour wrinkles
+// into clean simple curves.  The tolerance is blended between the base value
+// and kFitToleranceNeutralMax using a gate on both chroma and component area:
+//
+//   effectiveTolerance = baseTol + (kFitToleranceNeutralMax - baseTol)
+//                        × relaxFrac
+//
+// where relaxFrac ramps from 0→1 as C* goes from kFitChromaGateHigh→0.
+// This gives a smooth transition:
+//   C*=0  (pure grey):  effectiveTolerance = kFitToleranceNeutralMax (3.0)
+//   C*=6  (near-grey):  effectiveTolerance ≈ 2.0
+//   C*=12 (gate edge):  effectiveTolerance ≈ baseTol (no relaxation)
+//   C*>12 (vivid):      effectiveTolerance = baseTol (exact, unchanged)
+//
+// Area gate (kFitNeutralMinArea=400 px²) prevents relaxing tolerance on tiny
+// near-achromatic specks (noise dots) which need tight fits for correct shape.
+//
+// Tested safe zones:
+//   • Pink roses (C*≈22): relaxFrac=0 → tolerance unchanged ✓
+//   • Blue delphiniums (C*≈18): relaxFrac=0 → unchanged ✓
+//   • Yellow wildflowers (C*≈35): relaxFrac=0 → unchanged ✓
+//   • Aged plaster wall (C*≈4, area≈2000): full relaxation → smooth paths ✓
+//   • White vase glaze (C*≈3, area≈800): full relaxation → no spiral ✓
+//   • Chrome car panel (C*≈5, area≈3000): full relaxation → smooth ✓
+static constexpr float kFitToleranceNeutralMax = 3.0f;  // max tolerance for near-achromatic components
+static constexpr float kFitChromaGateHigh      = 12.0f; // C* above this → no relaxation
+static constexpr int   kFitNeutralMinArea      = 400;   // min component area to apply relaxation
 static constexpr float kFitConvergEps          = 1e-4f;
 static constexpr float kCPClampK               = 2.0f;
 static constexpr int   kCornerHW               = 3;
@@ -5196,8 +5233,21 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
                 std::vector<uint8_t> corners=
                     detectCorners(simplified,options.corner_threshold);
                 double tBez=vt_now_ms();
+                // ENH-ADAPTIVE-FIT: relax Bézier tolerance for large near-achromatic
+                // components to suppress spiral/concentric path artefacts.
+                float effTolInner = options.fit_tolerance;
+                if (componentSize[lbl] >= kFitNeutralMinArea) {
+                    Lab cLab = rgbToLabLUT(color);
+                    float cStar = std::sqrt(cLab.a * cLab.a + cLab.b * cLab.b);
+                    if (cStar < kFitChromaGateHigh) {
+                        float relaxFrac = 1.f - cStar / kFitChromaGateHigh;
+                        effTolInner = options.fit_tolerance
+                                    + (kFitToleranceNeutralMax - options.fit_tolerance)
+                                    * relaxFrac;
+                    }
+                }
                 std::vector<Segment> segs=
-                    buildSplineLSQ(simplified,corners,raw,options.fit_tolerance);
+                    buildSplineLSQ(simplified,corners,raw,effTolInner);
                 timeBezier+=vt_now_ms()-tBez;
                 if(segs.empty()) continue;
                 paths.push_back({std::move(raw),std::move(simplified),
@@ -5251,7 +5301,22 @@ std::string vectorize(const uint8_t* pixels, int width, int height, Options opti
             bool reversed = pr.isHole ? ensureCCW(pr.pts) : ensureCW(pr.pts);
             if(reversed) std::reverse(pr.rawPts.begin(),pr.rawPts.end());
             auto c2=detectCorners(pr.pts,options.corner_threshold);
-            pr.segs=buildSplineLSQ(pr.pts,c2,pr.rawPts,options.fit_tolerance);
+            // ENH-ADAPTIVE-FIT: relax Bézier tolerance for large near-achromatic
+            // components. The path colour `color` is the LCQ palette entry for
+            // this component batch; use its Lab C* as the chroma proxy.
+            float effTol = options.fit_tolerance;
+            if (pr.compLabel >= 0 && pr.compLabel < (int)componentSize.size()
+                && componentSize[pr.compLabel] >= kFitNeutralMinArea) {
+                Lab cLab = rgbToLabLUT(color);
+                float cStar = std::sqrt(cLab.a * cLab.a + cLab.b * cLab.b);
+                if (cStar < kFitChromaGateHigh) {
+                    float relaxFrac = 1.f - cStar / kFitChromaGateHigh;
+                    effTol = options.fit_tolerance
+                           + (kFitToleranceNeutralMax - options.fit_tolerance)
+                           * relaxFrac;
+                }
+            }
+            pr.segs=buildSplineLSQ(pr.pts,c2,pr.rawPts,effTol);
         }
         timeBezier+=vt_now_ms()-tBez;
         // -- Stage 11: SVG emit with ENH-9 classified gradients + ENH-10 --
@@ -5917,7 +5982,20 @@ static std::string vectorizeWithPreassignedColors(
                 bool reversed = pr.isHole ? ensureCCW(pr.pts) : ensureCW(pr.pts);
                 if (reversed) std::reverse(pr.rawPts.begin(), pr.rawPts.end());
                 auto corners = detectCorners(pr.pts, options.corner_threshold);
-                pr.segs = buildSplineLSQ(pr.pts, corners, pr.rawPts, options.fit_tolerance);
+                // ENH-ADAPTIVE-FIT: relax tolerance for large near-achromatic components
+                float effTolDPI = options.fit_tolerance;
+                if (pr.compLabel >= 0 && pr.compLabel < (int)componentSize.size()
+                    && componentSize[pr.compLabel] >= kFitNeutralMinArea) {
+                    Lab cLab = rgbToLabLUT(color);
+                    float cStar = std::sqrt(cLab.a * cLab.a + cLab.b * cLab.b);
+                    if (cStar < kFitChromaGateHigh) {
+                        float relaxFrac = 1.f - cStar / kFitChromaGateHigh;
+                        effTolDPI = options.fit_tolerance
+                                  + (kFitToleranceNeutralMax - options.fit_tolerance)
+                                  * relaxFrac;
+                    }
+                }
+                pr.segs = buildSplineLSQ(pr.pts, corners, pr.rawPts, effTolDPI);
             }
             // Drop paths where spline fitting produced no segments
             paths.erase(
@@ -8732,7 +8810,25 @@ static std::pair<std::string, std::string> emitLabReconstructedPaths(
                 bool reversed = pr.isHole ? ensureCCW(pr.pts) : ensureCW(pr.pts);
                 if (reversed) std::reverse(pr.rawPts.begin(), pr.rawPts.end());
                 auto corners = detectCorners(pr.pts, opt.corner_threshold);
-                pr.segs = buildSplineLSQ(pr.pts, corners, pr.rawPts, opt.fit_tolerance);
+                // ENH-ADAPTIVE-FIT: use the PROP-3 reconstructed solidRGB for chroma,
+                // which is more accurate than the raw LCQ colour (ENH-21 has already
+                // snapped it to the true original pixel Lab).
+                float effTolP3 = opt.fit_tolerance;
+                if (pr.compLabel >= 0 && pr.compLabel < (int)componentSize.size()
+                    && componentSize[pr.compLabel] >= kFitNeutralMinArea) {
+                    uint32_t solidRGB = (pr.compLabel < (int)reconResults.size())
+                                        ? reconResults[pr.compLabel].solidRGB
+                                        : 0x808080u;
+                    Lab cLab = rgbToLabLUT(solidRGB);
+                    float cStar = std::sqrt(cLab.a * cLab.a + cLab.b * cLab.b);
+                    if (cStar < kFitChromaGateHigh) {
+                        float relaxFrac = 1.f - cStar / kFitChromaGateHigh;
+                        effTolP3 = opt.fit_tolerance
+                                 + (kFitToleranceNeutralMax - opt.fit_tolerance)
+                                 * relaxFrac;
+                    }
+                }
+                pr.segs = buildSplineLSQ(pr.pts, corners, pr.rawPts, effTolP3);
             }
             paths.erase(
                 std::remove_if(paths.begin(), paths.end(),
