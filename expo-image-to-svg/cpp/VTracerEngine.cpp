@@ -906,7 +906,22 @@ static constexpr float kDetailMicroClusterAreaFrac = 0.0005f; // was 0.005
 // Only genuine specular highlights (L*>88, e.g. polished metal, glass rim, paper white)
 // should be lifted. Mid-bright surfaces (petals at L*78, brick at L*72) have their
 // luminance encoded correctly by the LCQ base — lifting them strips their colour.
-static constexpr float kHighlightLStarThresh   = 88.0f;  // FIX-WHITE-1: raised 76->88 — only genuine specular highlights
+//
+// FIX-WHITE-BOX-1: Raised further 88→93.
+// At 88, mountain haze (L*≈85-91) and bright sky (L*≈87-92) still qualified,
+// causing SAFETY-2's screen blend to emit near-white 2×2 rects over the sky and
+// haze regions.  screen(A≈0.95, B=any) converges to white regardless of opacity,
+// so even 0.25 opacity was enough to produce visible white boxes in bright areas.
+// At 93 only genuine specular pixels (polished chrome, glass catchlights, snow
+// sunlit surfaces) qualify.  Haze, sky, and pale flower faces are excluded.
+// Companion constant kSafetyHLMaxCellL (below) provides a second guard at the
+// per-cell emission stage for any near-white cells that still slip through.
+static constexpr float kHighlightLStarThresh   = 93.0f;  // FIX-WHITE-BOX-1: raised 88->93 — sky/haze no longer qualify
+// FIX-WHITE-BOX-1b: Per-cell already-white emission guard for SAFETY-2.
+// Even after raising kHighlightLStarThresh, a cell whose averaged L* exceeds
+// kSafetyHLMaxCellL is already white — a screen overlay adds nothing useful and
+// risks making it brighter.  Skip such cells unconditionally.
+static constexpr float kSafetyHLMaxCellL       = 91.0f;  // FIX-WHITE-BOX-1b: skip cells whose mean L* > 91
 // FIX-WHITE-2: Lowered shadow threshold back to 28.0 (was raised to 38 — WRONG).
 // At 38, rich-coloured midtones (foliage L*~35, deep flower centres L*~33) were
 // classified as "shadows" and had their L* dropped, pushing greens/purples darker.
@@ -1013,7 +1028,23 @@ static constexpr int   kLinGradStops           = 5;     // number of gradient st
 //  Blend: soft-light at opacity 0.38 — adds micro-hue depth without L* corruption.
 //  Gate: only emit if component HP chroma C* > kHPPass3MinChroma (suppresses noise).
 static constexpr float kHPPass3Opacity         = 0.38f; // soft-light blend weight
-static constexpr float kHPPass3MinChroma       = 5.0f;  // min HP mean C* to emit
+// FIX-WHITE-BOX-2: Raised kHPPass3MinChroma 5→12.
+// At C*=5 the gate admitted near-grey HP means from chrome car panels, where
+// specular-white HP pixels (L*≈95, C*≈2) averaged with dark-reflection pixels
+// (L*≈25, C*≈8) produced HP means with C*≈5-8 — just above the old threshold.
+// The resulting large bbox rects (400-800px wide) with L*≈60-75, C*≈6 were
+// rendered at soft-light 0.38 over mid-bright bases, brightening them toward
+// white and producing the large white boxes visible on the McLaren body.
+// At C*=12 only components with genuine chromatic HP signal (flower petals,
+// foliage micro-texture, painted surfaces) pass the gate.  Chrome and near-grey
+// metal specular averages (C*<12) are suppressed.
+static constexpr float kHPPass3MinChroma       = 12.0f; // FIX-WHITE-BOX-2: raised 5->12 — excludes chrome/metal specular HP means
+// FIX-WHITE-BOX-2b: HP-mean L* gate. Skip components whose HP mean L* > 80.
+// A near-white HP mean (L*>80) indicates the HP buffer is dominated by specular
+// reflections, not chromatic surface texture.  Soft-light of a near-white fill
+// over any base always brightens toward white — exactly the wrong behaviour for
+// a layer whose purpose is to add *hue* depth, not luminance.
+static constexpr float kHPPass3MaxMeanL        = 80.0f; // FIX-WHITE-BOX-2b: skip components with HP mean L* > 80
 static constexpr float kHPPass3MinCoverage     = 0.06f; // min fraction of HP pixels in component
 //
 //  ENH-CHROMA-GRAD: Per-ring hue variation in gradient stops.
@@ -8029,6 +8060,18 @@ static LabReconResult computeLabReconstructionTarget(
             std::string def = hdr;
             for (int b = 0; b < kProp3GradRings; ++b) {
                 float stopL     = ringL[b];
+                // FIX-WHITE-BOX-3: Clamp stopL to targetLab.L + 18.
+                // Without this clamp, outer rings on mountain/snowfield components
+                // received stopL≈96 (snow edge) while targetLab.L≈30-85 (dark rock
+                // or grey mountain face).  chromaScale = sqrt(96/targetL) was in range
+                // but targetLab a*/b* were near-zero (grey target), so the outer stop
+                // was Lab{96, ~1, ~1} → near-white #fafafb.  The resulting gradient
+                // rendered as a hard white rectangle at the snow edge position.
+                // Clamping to targetLab.L + 18 limits how far a gradient stop can
+                // exceed the component's mean tone.  Snow highlights are still
+                // represented (18 L* = a meaningful lightening step) but cannot
+                // blow out to pure white on a grey-tone component.
+                stopL = std::min(stopL, targetLab.L + 18.f);
                 // FIX-ENH-D: Replace multiplicative lRatio chroma scaling with sqrt-based
                 // chromaScale. lRatio = stopL/targetLab.L had two failure modes:
                 //  1. Lower clamp 0.15 kills colour in all dark gradient stops (shadow
@@ -8205,6 +8248,9 @@ static LabReconResult computeLabReconstructionTarget(
                     std::string lgdef = lghdr;
                     for (int b = 0; b < kLinGradStops; ++b) {
                         float stopL2 = lgBinL[b];
+                        // FIX-WHITE-BOX-3: Same stopL clamp as radial — prevents linear
+                        // gradient outer stops blowing out to near-white on grey targets.
+                        stopL2 = std::min(stopL2, targetLab.L + 18.f);
                         // FIX-ENH-D (linear grad): Same sqrt-based chromaScale as radial.
                         float tC2 = std::sqrt(targetLab.a*targetLab.a + targetLab.b*targetLab.b);
                         float chromaScale2 = (targetLab.L > 1e-3f && tC2 > 0.5f)
@@ -9290,6 +9336,13 @@ std::string vectorizeMultiPass(
                 float hpC3 = std::sqrt(meanHP3.a * meanHP3.a + meanHP3.b * meanHP3.b);
                 if (hpC3 < kHPPass3MinChroma) continue;
 
+                // FIX-WHITE-BOX-2b: L* gate — skip near-white HP means.
+                // When the HP mean L* > kHPPass3MaxMeanL, the HP buffer for this
+                // component is dominated by specular highlights, not texture.
+                // soft-light of a near-white fill brightens the base toward white,
+                // producing large white bbox rects on chrome panels and snow surfaces.
+                if (meanHP3.L > kHPPass3MaxMeanL) continue;
+
 
                 uint32_t hpRGB3 = labToRGB(meanHP3);
                 char rbuf3[200];
@@ -9550,6 +9603,11 @@ std::string vectorizeMultiPass(
                         (float)(c.a / c.n),
                         (float)(c.b / c.n)
                     };
+                    // FIX-WHITE-BOX-1b: Skip cells whose averaged L* > kSafetyHLMaxCellL.
+                    // A cell that is already near-white gains nothing from a screen overlay
+                    // (screen of ~white on ~white = white) and produces visible white boxes
+                    // on sky gradients, haze, and snow highlights.
+                    if (avg.L > kSafetyHLMaxCellL) continue;
                     const uint32_t rgb = labToRGB(avg);
                     const int gx = ci % gcW, gy = ci / gcW;
                     const int rx = bx0 + gx * kSafetyCompCell;
@@ -9886,12 +9944,72 @@ std::string vectorizeMultiPass(
     //   [9] layer-edges   Pass6     — structural ink strokes
 
 
-    // [0] White base rect — required for correct blend-mode compositing
+    // [0] Background base rect — required for correct blend-mode compositing.
+    //
+    // FIX-WHITE-BOX-4: Replace hard-coded fill="white" with the dominant
+    // image tone sampled from a coarse grid of original pixels.
+    //
+    // Rationale: a pure white background makes any near-white SVG rect visually
+    // indistinguishable from the canvas — it looks like a transparent hole — and
+    // causes all screen/multiply blend-mode layers to produce the maximum-white
+    // result for near-white inputs.  For outdoor photographic subjects (sky, snow,
+    // haze) this amplifies the white-box artefact.
+    //
+    // The dominant tone is the chroma²-weighted Lab mean over a 16×16 grid of
+    // original pixels (256 samples maximum, O(1) cost).  Using chroma² weighting
+    // biases the background toward the most saturated regions (sky blue, grass
+    // green) rather than the achromatic mean which would be near-grey for most
+    // scenes.  The result is clamped to L* ≤ 85 and C* ≤ 30 so it stays neutral
+    // enough not to tint the composition.
+    //
+    // For scenes where no original pixel buffer is available (pure-path mode),
+    // the background falls back to a neutral light-grey (#f0f0f0) rather than
+    // white — still better than white for blend-mode anchoring.
     {
-        char bgRect[128];
+        uint32_t bgColor = 0xF0F0F0u; // fallback: neutral light-grey
+        if (originalPixels && width > 0 && height > 0) {
+            // Sample up to 16×16 = 256 evenly-spaced pixels
+            const int stepX = std::max(1, width  / 16);
+            const int stepY = std::max(1, height / 16);
+            double sumWL = 0, sumWA = 0, sumWB = 0, sumW = 0;
+            for (int sy = 0; sy < height; sy += stepY) {
+                for (int sx = 0; sx < width; sx += stepX) {
+                    const uint8_t* p = originalPixels
+                                       + static_cast<size_t>(sy * width + sx) * 4;
+                    if (p[3] < 128) continue;
+                    const Lab lab = rgbToLabLUT(packRGB(p[0], p[1], p[2]));
+                    // Chroma² weight: biases toward saturated (sky, foliage) vs grey
+                    const float cSq = lab.a * lab.a + lab.b * lab.b + 0.01f;
+                    sumWL += cSq * lab.L;
+                    sumWA += cSq * lab.a;
+                    sumWB += cSq * lab.b;
+                    sumW  += cSq;
+                }
+            }
+            if (sumW > 1e-6) {
+                Lab bgLab = {
+                    (float)(sumWL / sumW),
+                    (float)(sumWA / sumW),
+                    (float)(sumWB / sumW)
+                };
+                // Clamp: keep background neutral — not too bright, not too saturated
+                bgLab.L = std::min(bgLab.L, 85.f);
+                float bgC = std::sqrt(bgLab.a * bgLab.a + bgLab.b * bgLab.b);
+                if (bgC > 30.f) {
+                    // Scale a*/b* down to C*=30
+                    const float scale = 30.f / bgC;
+                    bgLab.a *= scale;
+                    bgLab.b *= scale;
+                }
+                bgColor = labToRGB(bgLab);
+            }
+        }
+        char bgRect[160];
         snprintf(bgRect, sizeof(bgRect),
-            "<rect id=\"layer-ground\" width=\"%d\" height=\"%d\" fill=\"white\"/>",
-            width, height);
+            "<rect id=\"layer-ground\" width=\"%d\" height=\"%d\" "
+            "fill=\"#%02x%02x%02x\"/>",
+            width, height,
+            rCh(bgColor), gCh(bgColor), bCh(bgColor));
         svg += bgRect;
     }
 
