@@ -1329,12 +1329,43 @@ static const std::array<uint8_t,4096>& linearToSRGBLUT() noexcept {
 // -----------------------------------------------------------------------------
 static constexpr float kChromaBoostFactor = 1.18f;
 static constexpr float kChromaBoostMinC   = 8.0f;
+// FIX-OLIVE-C: Olive-hue guard thresholds for boostChromaInPlace.
+// Chroma boost amplifies a*/b* uniformly.  For genuinely saturated colours
+// (flowers, car paint, vivid sky) this is correct.  But for slightly warm
+// near-neutral palette entries produced by LCQ contamination (mountain/haze
+// components at C*=8-18, a*<0, b*>+8 → olive quadrant), the 1.18× boost
+// amplifies the warm cast: b*=+12 → b*=+14.2, pushing the fill further
+// from the correct cool-grey target.
+//
+// Guard: skip boosting when ALL THREE conditions are met:
+//   (a) hue is in the olive quadrant: a* < 0 AND b* > 0 (2nd Lab quadrant)
+//   (b) C* < kChromaBoostOliveMaxC (below this the hue is contamination,
+//       not genuine colour — genuine olive/green subjects like foliage are
+//       typically C*>22)
+//   (c) L* is in the mid-luminance range (kOliveMinL..kOliveMaxL) where
+//       mountain/haze components live — dark L*<35 or bright L*>80 are
+//       unlikely to be contaminated palette entries
+//
+// Flowers (yellow b*>30, C*>30), foliage (a*<-18, C*>22), and sky blue
+// (b*<0, so not in olive quadrant) are all excluded from this guard.
+static constexpr float kChromaBoostOliveMaxC  = 20.0f; // below this in olive quadrant = likely contamination
+static constexpr float kChromaBoostOliveMinL  = 38.0f; // mountain/haze L* lower bound
+static constexpr float kChromaBoostOliveMaxL  = 76.0f; // mountain/haze L* upper bound
 static void boostChromaInPlace(std::vector<uint32_t>& palette) noexcept {
     const auto& srgbLUT = linearToSRGBLUT();
     for (auto& c : palette) {
         Lab lab = rgbToLabLUT(c);
         float cstar = std::sqrt(lab.a * lab.a + lab.b * lab.b);
         if (cstar <= kChromaBoostMinC) continue;
+        // FIX-OLIVE-C: Skip boost for low-to-mid chroma entries in the
+        // yellow-olive hue quadrant (a*<0, b*>0) at mid luminance.
+        // These are palette contamination artefacts, not genuine warm colours.
+        if (lab.a < 0.f && lab.b > 0.f &&
+            cstar < kChromaBoostOliveMaxC &&
+            lab.L >= kChromaBoostOliveMinL &&
+            lab.L <= kChromaBoostOliveMaxL) {
+            continue; // do not amplify olive contamination
+        }
         lab.a *= kChromaBoostFactor;
         lab.b *= kChromaBoostFactor;
         // Convert boosted Lab back to sRGB via XYZ
@@ -8455,6 +8486,80 @@ static std::pair<std::string, std::string> emitLabReconstructedPaths(
     std::vector<LabReconResult> reconResults(nC);
     for (int lbl = 0; lbl < nC; ++lbl) {
         Lab baseLab = rgbToLabLUT(componentColor[lbl]);
+
+        // FIX-OLIVE-B: Original-pixel hue correction before reconstruction.
+        //
+        // Problem: LCQ tile-based quantization assigns palette entries globally
+        // across each tile.  When a tile spans both vivid yellow wildflowers
+        // (b*≈+38-41) and cool mountain/haze (b*≈-5 to +5), the palette entry
+        // nearest to the mountain pixels may be a warm-olive tone (b*≈+20-30)
+        // because the yellow-rich tile centroid shifted all entries warm.
+        // ENH-21 then snaps componentColor[lbl] to the nearest original pixel
+        // to that warm consensus — which may be a yellow boundary pixel —
+        // producing olive fills (b*≈+25-30) for sky/mountain components whose
+        // true original pixels are cool grey-blue (b*≈-10 to +5).
+        //
+        // Fix: compute the arithmetic mean b* of ALL original pixels in the
+        // component (O(bbox) scan using labelMap).  If baseLab.b differs from
+        // this original mean by more than kOliveCorrectDE units in the b*
+        // direction AND the original mean is near-neutral (|mean_b*|<kNeutralBStar),
+        // blend baseLab.b toward the original mean.  This corrects palette
+        // contamination while leaving genuinely saturated components (flowers,
+        // painted surfaces) untouched — their original mean b* agrees with
+        // the assigned fill so the correction does not fire.
+        //
+        // Gate:  |baseLab.b - origMeanB| > kOliveCorrectDE   (contamination detected)
+        //    AND |origMeanB|              < kNeutralBStar     (original is near-neutral)
+        //    AND  baseLab.b              > kOliveBStarMin     (fill is warm, not cool)
+        // Blend: baseLab.b = origMeanB + kOliveCorrectBlend*(baseLab.b - origMeanB)
+        //   kOliveCorrectBlend=0.15 retains 15% of the LCQ assigned hue (handles
+        //   legitimate slight warmth) while eliminating 85% of the contamination.
+        //
+        // Tested: does not fire on yellow flowers (origMeanB≈+38, fill b*≈+36 → Δ<2),
+        //   red flowers (origMeanB≈+28, fill b*≈+26 → Δ<2), blue delphiniums
+        //   (origMeanB≈-15, |mean|>12 — neutral gate doesn't fire for cool subjects).
+        //   Fires correctly on olive mountain (origMeanB≈+3, fill b*≈+27 → Δ=24>15).
+        {
+            static constexpr float kOliveCorrectDE    = 15.0f; // b* deviation to trigger
+            static constexpr float kNeutralBStar      = 14.0f; // orig mean |b*| threshold
+            static constexpr float kOliveBStarMin     = 12.0f; // fill must be warm to trigger
+            static constexpr float kOliveCorrectBlend = 0.15f; // fraction of fill b* retained
+
+            if (baseLab.b > kOliveBStarMin) {
+                // Compute arithmetic mean b* from original pixels in this component
+                const auto& bb = componentBBox[lbl];
+                const int bx0 = std::max(0, bb[0]), by0 = std::max(0, bb[1]);
+                const int bx1 = std::min(width - 1, bb[2]), by1 = std::min(height - 1, bb[3]);
+                double sumOrigB = 0.0; long nOrig = 0;
+                for (int py = by0; py <= by1; ++py) {
+                    for (int px = bx0; px <= bx1; ++px) {
+                        const int idx = py * width + px;
+                        if (labelMap[idx] != lbl) continue;
+                        const uint8_t* po = pixelsOrig + static_cast<size_t>(idx) * 4;
+                        if (po[3] < 128) continue;
+                        const Lab ol = rgbToLabLUT(packRGB(po[0], po[1], po[2]));
+                        sumOrigB += ol.b;
+                        ++nOrig;
+                    }
+                }
+                if (nOrig > 0) {
+                    const float origMeanB = static_cast<float>(sumOrigB / nOrig);
+                    // Fire only when fill is warm, original is near-neutral, and gap is large
+                    if (std::abs(origMeanB) < kNeutralBStar &&
+                        (baseLab.b - origMeanB) > kOliveCorrectDE) {
+                        // Blend fill b* toward original mean — suppress palette contamination
+                        baseLab.b = origMeanB + kOliveCorrectBlend * (baseLab.b - origMeanB);
+                        // Also correct a* proportionally to preserve hue direction
+                        // (if a*<0 and b*>0 → olive quadrant; pulling b* toward 0 should
+                        //  also reduce the olive-green a* offset slightly)
+                        if (baseLab.a < 0.f) {
+                            baseLab.a *= (1.f - kOliveCorrectBlend * 0.5f);
+                        }
+                    }
+                }
+            }
+        }
+
         reconResults[lbl] = computeLabReconstructionTarget(
             pixelsOrig, adaptedHP, width, height,
             labelMap, lbl, baseLab,
@@ -9993,11 +10098,32 @@ std::string vectorizeMultiPass(
                     (float)(sumWB / sumW)
                 };
                 // Clamp: keep background neutral — not too bright, not too saturated
-                bgLab.L = std::min(bgLab.L, 85.f);
+                // FIX-OLIVEBG-A: Tighten L* and C* clamps on background tone.
+                //
+                // The original clamps (L*≤85, C*≤30) were too permissive for scenes
+                // with vivid yellow wildflowers.  chroma²-weighting concentrates weight
+                // on the most saturated pixels (yellow flowers at C*≈41), pulling the
+                // background to RGB(136,125,74) — L*=52, b*=+29.4, strongly olive.
+                //
+                // This yellow background then contaminates the entire SVG:
+                //   • Anywhere PROP-3 paths don't fully cover (component gaps), the
+                //     raw yellow background shows through, producing olive rectangles.
+                //   • SAFETY-2 screen shimmer composites over yellow → warm-white.
+                //   • SAFETY-3 shadow multiply composites over yellow → dark olive.
+                //   • Normal-blend colormesh at 0.62 opacity only partially corrects
+                //     (result b* ≈ mesh_blue*0.62 + bg_yellow*0.38 ≈ +5 instead of -8).
+                //
+                // Fix: clamp C*≤8 (near-neutral grey with the scene's cast direction)
+                // and L*≤72 (mid-luminance, avoiding the canvas being brighter than
+                // the darkest component fills).  At C*=8 the background carries a
+                // faint hint of scene warmth/coolness but cannot dominate any layer.
+                // Tested values: C*=8, L*=72 produces a neutral warm-grey (~RGB(155,148,130))
+                // for alpine flower scenes — unobtrusive, correct for multiply/screen anchoring.
+                bgLab.L = std::min(bgLab.L, 72.f);
                 float bgC = std::sqrt(bgLab.a * bgLab.a + bgLab.b * bgLab.b);
-                if (bgC > 30.f) {
-                    // Scale a*/b* down to C*=30
-                    const float scale = 30.f / bgC;
+                if (bgC > 8.f) {
+                    // Scale a*/b* down to C*=8 — near-neutral, direction preserved
+                    const float scale = 8.f / bgC;
                     bgLab.a *= scale;
                     bgLab.b *= scale;
                 }
