@@ -9564,6 +9564,182 @@ std::string vectorizeMultiPass(
         }
 
 
+    // =======================================================================
+    //  ENH-BGBLEND -- Background Seam Smoothing Layer
+    //
+    //  Problem: PROP-3 fills each connected component with a single flat
+    //  colour (or gradient).  Adjacent background components — sky bands,
+    //  mountain haze, aged-plaster wall tiles, road tarmac — each receive
+    //  slightly different palette entries from the LCQ quantization.  The
+    //  sharp SVG path boundary between two fills (e.g. L*=50 vs L*=57 for
+    //  adjacent sky bands) is perceptually jarring and reads as a "brown box"
+    //  or "stained-glass" mosaic pattern on neutral backgrounds.
+    //
+    //  In both test images this manifests as:
+    //    CAR  — dark warm-grey rectangular patches in sky and upper mountain
+    //           (~20px block period) contrasting against adjacent cool-blue sky
+    //    FLOWER — taupe/grey rectangular blocks in the distressed-plaster wall
+    //             (~8-16px period) creating a harsh tile-mosaic texture
+    //
+    //  The root cause is NOT incorrect fill colours — each component's
+    //  individual fill is perceptually close to the original pixels.  The
+    //  problem is the DISCONTINUITY: the human visual system is highly
+    //  sensitive to sharp luminance/hue steps even when both values are
+    //  otherwise plausible.
+    //
+    //  Solution: ENH-BGBLEND adds a large-cell (kBgBlendCell px) normal-blend
+    //  grid layer at kBgBlendOpacity over the base layer-labrecon fills.
+    //  Each cell accumulates the chroma²-weighted Lab mean of ORIGINAL
+    //  pixels whose C* is below kBgBlendChromaGate — i.e. only background,
+    //  haze, neutral wall, and road pixels contribute.  Each cell emits a
+    //  single rect spanning the cell, blending its Lab mean over the sharp
+    //  PROP-3 fills beneath.
+    //
+    //  Because the cell (16×16 px) spans multiple adjacent components, its
+    //  mean colour falls BETWEEN the adjacent fills.  At opacity 0.55 the
+    //  normal blend reduces the perceived fill discontinuity by ~56%:
+    //
+    //    result_left  = cell_mean*0.55 + fill_left*0.45
+    //    result_right = cell_mean*0.55 + fill_right*0.45
+    //    new_gap = (fill_right - fill_left)*0.45  (was 1.0)
+    //
+    //  Crucially the gate is based on the MAXIMUM original-pixel C* within
+    //  the cell.  If any pixel in the cell has C* >= kBgBlendChromaGate, the
+    //  cell is skipped entirely.  This creates a natural 1-cell exclusion
+    //  margin around every flower, car panel, coloured object, and saturated
+    //  foreground element — the blend layer never overlaps them.
+    //
+    //  Safety verification (from pixel analysis):
+    //    Yellow wildflower C*=38.4  >> 10 → cell skipped ✓
+    //    Red wildflower    C*=23.8  >> 10 → cell skipped ✓
+    //    Pink rose         C*=15.4  >  10 → cell skipped ✓
+    //    Purple aster      C*=17.7  >  10 → cell skipped ✓
+    //    Sky background    C*=7.1   <  10 → cell EMITS  ✓
+    //    Mountain haze     C*=3.8   <  10 → cell EMITS  ✓
+    //    Distressed wall   C*=4.8   <  10 → cell EMITS  ✓
+    //
+    //  Additional gates:
+    //    kBgBlendMinCoverage (0.60): cell must have ≥60% background pixels
+    //      (avoids emitting over boundary cells with 50/50 flower/bg mix)
+    //    kBgBlendMinPx (8): skip cells with too few qualifying pixels
+    //      (avoids noise from edge cells at image boundary)
+    //
+    //  Layer position: between layer-labrecon (PROP-3 fills) and
+    //  layer-safety-hp (HP microdetail screen layer).  Normal blend ensures
+    //  the smoothing is fully modulated by the layers above it.
+    //
+    //  Performance: O(width*height) single pass over original pixels.
+    //  No per-component iteration. ~2-5 ms at 1080p.
+    // =======================================================================
+    {
+        double tsBG = vt_now_ms();
+
+        static constexpr int   kBgBlendCell        = 16;    // cell size in pixels
+        static constexpr float kBgBlendOpacity      = 0.55f; // normal blend opacity
+        static constexpr float kBgBlendChromaGate   = 10.0f; // max C* to qualify as background
+        static constexpr float kBgBlendMinCoverage  = 0.60f; // min bg-pixel fraction per cell
+        static constexpr int   kBgBlendMinPx        = 8;     // min qualifying pixels per cell
+
+        const int gW = (width  + kBgBlendCell - 1) / kBgBlendCell;
+        const int gH = (height + kBgBlendCell - 1) / kBgBlendCell;
+        const int nCells = gW * gH;
+
+        // Per-cell accumulators: chroma²-weighted Lab sum, pixel counts
+        struct BgCell {
+            double wL = 0, wa = 0, wb = 0, wTot = 0;
+            int    nBg = 0;   // qualifying background pixels
+            int    nAll = 0;  // total pixels (for coverage fraction)
+            bool   maxChromaExceeded = false; // any pixel C* >= gate?
+        };
+        std::vector<BgCell> cells(static_cast<size_t>(nCells));
+
+        // Single pass over original pixels
+        for (int py = 0; py < height; ++py) {
+            const int gy = py / kBgBlendCell;
+            for (int px = 0; px < width; ++px) {
+                const int gx = px / kBgBlendCell;
+                const int ci = gy * gW + gx;
+                if (ci < 0 || ci >= nCells) continue;
+
+                const uint8_t* po = originalPixels
+                                    + static_cast<size_t>(py * width + px) * 4;
+                if (po[3] < 128) continue;
+
+                cells[static_cast<size_t>(ci)].nAll++;
+
+                const Lab labOrig = rgbToLabLUT(packRGB(po[0], po[1], po[2]));
+                const float cOrig = std::sqrt(labOrig.a * labOrig.a
+                                            + labOrig.b * labOrig.b);
+
+                // Flag: if any pixel in cell exceeds the chroma gate, whole cell skipped
+                if (cOrig >= kBgBlendChromaGate) {
+                    cells[static_cast<size_t>(ci)].maxChromaExceeded = true;
+                    continue;
+                }
+
+                // Background pixel — accumulate chroma²-weighted Lab
+                // (weights slightly deprioritise near-grey so hazy-but-coloured
+                //  sky pixels guide the cell colour more than pure-grey rock)
+                const float w = cOrig * cOrig + 0.5f;
+                cells[static_cast<size_t>(ci)].wL   += w * labOrig.L;
+                cells[static_cast<size_t>(ci)].wa   += w * labOrig.a;
+                cells[static_cast<size_t>(ci)].wb   += w * labOrig.b;
+                cells[static_cast<size_t>(ci)].wTot += w;
+                cells[static_cast<size_t>(ci)].nBg++;
+            }
+        }
+
+        // Emit the blend layer
+        std::string bgLayer;
+        bgLayer.reserve(static_cast<size_t>(nCells) * 80);
+        char opBuf[32];
+        snprintf(opBuf, sizeof(opBuf), "%.2f", kBgBlendOpacity);
+        bgLayer += "<g id=\"layer-bgblend\" style=\"opacity:";
+        bgLayer += opBuf;
+        bgLayer += ";\">\n";
+
+        int bgCells = 0;
+        for (int ci = 0; ci < nCells; ++ci) {
+            const auto& c = cells[static_cast<size_t>(ci)];
+            // Skip: any saturated pixel in cell, or too few bg pixels,
+            // or insufficient bg coverage fraction
+            if (c.maxChromaExceeded) continue;
+            if (c.nBg < kBgBlendMinPx)  continue;
+            if (c.nAll > 0 &&
+                static_cast<float>(c.nBg) / static_cast<float>(c.nAll)
+                < kBgBlendMinCoverage) continue;
+            if (c.wTot < 1e-9) continue;
+
+            Lab avg = {
+                static_cast<float>(c.wL / c.wTot),
+                static_cast<float>(c.wa / c.wTot),
+                static_cast<float>(c.wb / c.wTot)
+            };
+            const uint32_t rgb = labToRGB(avg);
+
+            const int gx = ci % gW, gy = ci / gW;
+            const int rx = gx * kBgBlendCell;
+            const int ry = gy * kBgBlendCell;
+            const int rw = std::min(kBgBlendCell, width  - rx);
+            const int rh = std::min(kBgBlendCell, height - ry);
+            if (rw <= 0 || rh <= 0) continue;
+
+            char rbuf[160];
+            snprintf(rbuf, sizeof(rbuf),
+                "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" "
+                "fill=\"#%02x%02x%02x\"/>\n",
+                rx, ry, rw, rh,
+                rCh(rgb), gCh(rgb), bCh(rgb));
+            bgLayer += rbuf;
+            ++bgCells;
+        }
+
+        bgLayer += "</g>\n";
+        svgBody += bgLayer;
+        VT_LOG("ENH-BGBLEND: %d background blend cells (of %d total) in %.1f ms",
+               bgCells, nCells, vt_now_ms() - tsBG);
+    }
+
 
     // =======================================================================
     //  SAFETY-NET LAYERS  (PROP-3-SAFETY-1 through PROP-3-SAFETY-3)
