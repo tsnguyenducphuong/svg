@@ -15,7 +15,7 @@ public class ExpoImageToSvgModule: Module {
 
 
    OnCreate {
-     if let runtime = self.appContext?.runtime {
+     if let runtime = try? appContext?.runtime {
        ExpoImageToSvgJSIInstaller.install(runtime)
      } else {
        print("[ExpoImageToSvg] Error: JSI Runtime is unavailable.")
