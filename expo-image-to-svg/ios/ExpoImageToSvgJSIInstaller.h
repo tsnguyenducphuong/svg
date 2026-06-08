@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <ExpoModulesCore/EXJavaScriptRuntime.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -7,9 +8,9 @@ NS_ASSUME_NONNULL_BEGIN
 /**
  * Registers the 'nativeVectorize' and 'nativeVectorizeMultiPass' functions
  * into the global JSI runtime.
- * @param jsiRuntimePtr An opaque pointer to the facebook::jsi::Runtime.
+ * @param runtimeObj The EXJavaScriptRuntime instance from appContext.runtime.
  */
-+ (void)install:(void *)jsiRuntimePtr;
++ (void)install:(id)runtimeObj;
 
 @end
 
