@@ -2,65 +2,61 @@ import ExpoModulesCore
 import Foundation
 import WebKit
 
-
 public class ExpoImageToSvgModule: Module {
- // Each module class must implement the definition function. The definition consists of components
- // that describes the module's functionality and behavior.
- // See https://docs.expo.dev/modules/module-api for more details about available components.
- public func definition() -> ModuleDefinition {
-   // Sets the name of the module that JavaScript code will use to refer to the module. Takes a string as an argument.
-   // Can be inferred from module's class name, but it's recommended to set it explicitly for clarity.
-   // The module will be accessible from `requireNativeModule('ExpoImageToSvg')` in JavaScript.
-   Name("ExpoImageToSvg")
+  // Each module class must implement the definition function. The definition consists of components
+  // that describes the module's functionality and behavior.
+  // See https://docs.expo.dev/modules/module-api for more details about available components.
+  public func definition() -> ModuleDefinition {
+    // Sets the name of the module that JavaScript code will use to refer to the module. Takes a string as an argument.
+    // Can be inferred from module's class name, but it's recommended to set it explicitly for clarity.
+    // The module will be accessible from `requireNativeModule('ExpoImageToSvg')` in JavaScript.
+    Name("ExpoImageToSvg")
 
+    OnCreate {
+      // appContext?.runtime is internal to ExpoModulesCore in SDK 54 and is not
+      // accessible from outside the framework. Instead we reach the JSI runtime
+      // through RCTCxxBridge.runtime via the public reactBridge property, which
+      // is stable across SDK 54 (both Old and bridged-New Architecture).
+      if let bridge = appContext?.reactBridge {
+        ExpoImageToSvgJSIInstaller.installWithBridge(bridge)
+      } else {
+        print("[ExpoImageToSvg] Error: JSI Runtime is unavailable (reactBridge is nil).")
+      }
+    }
 
-   OnCreate {
-     if let runtime = try? appContext?.runtime {
-       ExpoImageToSvgJSIInstaller.install(runtime)
-     } else {
-       print("[ExpoImageToSvg] Error: JSI Runtime is unavailable.")
-     }
-   }
+    // Defines constant property on the module.
+    Constant("PI") {
+      Double.pi
+    }
 
+    // Defines event names that the module can send to JavaScript.
+    Events("onChange")
 
-   // Defines constant property on the module.
-   Constant("PI") {
-     Double.pi
-   }
+    // Defines a JavaScript synchronous function that runs the native code on the JavaScript thread.
+    Function("hello") {
+      return "Hello world! 👋"
+    }
 
+    // Defines a JavaScript function that always returns a Promise and whose native code
+    // is by default dispatched on the different thread than the JavaScript runtime runs on.
+    AsyncFunction("setValueAsync") { (value: String) in
+      // Send an event to JavaScript.
+      self.sendEvent("onChange", [
+        "value": value
+      ])
+    }
 
-   // Defines event names that the module can send to JavaScript.
-   Events("onChange")
+    // Enables the module to be used as a native view. Definition components that are accepted as part of the
+    // view definition: Prop, Events.
+    View(ExpoImageToSvgView.self) {
+      // Defines a setter for the `url` prop.
+      Prop("url") { (view: ExpoImageToSvgView, url: URL) in
+        if view.webView.url != url {
+          view.webView.load(URLRequest(url: url))
+        }
+      }
 
-
-   // Defines a JavaScript synchronous function that runs the native code on the JavaScript thread.
-   Function("hello") {
-     return "Hello world! 👋"
-   }
-
-
-   // Defines a JavaScript function that always returns a Promise and whose native code
-   // is by default dispatched on the different thread than the JavaScript runtime runs on.
-   AsyncFunction("setValueAsync") { (value: String) in
-     // Send an event to JavaScript.
-     self.sendEvent("onChange", [
-       "value": value
-     ])
-   }
-
-
-   // Enables the module to be used as a native view. Definition components that are accepted as part of the
-   // view definition: Prop, Events.
-   View(ExpoImageToSvgView.self) {
-     // Defines a setter for the `url` prop.
-     Prop("url") { (view: ExpoImageToSvgView, url: URL) in
-       if view.webView.url != url {
-         view.webView.load(URLRequest(url: url))
-       }
-     }
-
-
-     Events("onLoad")
-   }
- }
+      Events("onLoad")
+    }
+  }
 }

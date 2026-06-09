@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
-#import <ExpoModulesCore/EXJavaScriptRuntime.h>
+#import <React/RCTBridge.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -8,9 +8,11 @@ NS_ASSUME_NONNULL_BEGIN
 /**
  * Registers the 'nativeVectorize' and 'nativeVectorizeMultiPass' functions
  * into the global JSI runtime.
- * @param runtimeObj The EXJavaScriptRuntime instance from appContext.runtime.
+ * @param bridge The RCTBridge instance from appContext.reactBridge.
+ *               Internally casts to RCTCxxBridge and reads javaScriptContextHolder
+ *               to reach the underlying jsi::Runtime — compatible with SDK 54+.
  */
-+ (void)install:(id)runtimeObj;
++ (void)installWithBridge:(RCTBridge *)bridge;
 
 @end
 
