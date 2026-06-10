@@ -13,14 +13,14 @@ public class ExpoImageToSvgModule: Module {
     Name("ExpoImageToSvg")
 
     OnCreate {
-      // appContext?.runtime is internal to ExpoModulesCore in SDK 54 and is not
-      // accessible from outside the framework. Instead we reach the JSI runtime
-      // through RCTCxxBridge.runtime via the public reactBridge property, which
-      // is stable across SDK 54 (both Old and bridged-New Architecture).
-      if let bridge = appContext?.reactBridge {
-        ExpoImageToSvgJSIInstaller.installWithBridge(bridge)
+      // AppContext.runtime is a throwing computed property in SDK 54 that returns
+      // ExpoRuntime (a subclass of JavaScriptRuntime / EXJavaScriptRuntime).
+      // Using `try?` is correct — it returns nil if the runtime isn't ready yet.
+       
+      if let runtime = try? appContext?.runtime {
+        ExpoImageToSvgJSIInstaller.install(runtime)
       } else {
-        print("[ExpoImageToSvg] Error: JSI Runtime is unavailable (reactBridge is nil).")
+        print("[ExpoImageToSvg] Error: JSI Runtime is unavailable.")
       }
     }
 

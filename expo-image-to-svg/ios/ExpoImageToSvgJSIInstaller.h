@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
-#import <React/RCTBridge.h>
+#import <ExpoModulesCore/EXJavaScriptRuntime.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -8,11 +8,12 @@ NS_ASSUME_NONNULL_BEGIN
 /**
  * Registers the 'nativeVectorize' and 'nativeVectorizeMultiPass' functions
  * into the global JSI runtime.
- * @param bridge The RCTBridge instance from appContext.reactBridge.
- *               Internally casts to RCTCxxBridge and reads javaScriptContextHolder
- *               to reach the underlying jsi::Runtime — compatible with SDK 54+.
+ * @param runtime The EXJavaScriptRuntime (Swift name: JavaScriptRuntime) obtained
+ *                from `try? appContext?.runtime` inside OnCreate. This is the
+ *                correct SDK 54 approach — AppContext.runtime is a throwing
+ *                computed property returning ExpoRuntime (a JavaScriptRuntime subclass).
  */
-+ (void)installWithBridge:(RCTBridge *)bridge;
++ (void)install:(EXJavaScriptRuntime *)runtime;
 
 @end
 

@@ -1,5 +1,5 @@
 #import "ExpoImageToSvgJSIInstaller.h"
-#import <React/RCTBridge+Private.h>   // exposes RCTCxxBridge and .runtime
+#import <ExpoModulesCore/EXJavaScriptRuntime.h>
 #import <jsi/jsi.h>
 #import "VTracerEngine.hpp"
 
@@ -432,24 +432,20 @@ jsi::Value vectorizeMultiPassJSI(
 
 // =============================================================================
 //  Objective-C entry point
-//  Called from Swift via appContext?.reactBridge.
-//  RCTCxxBridge (the concrete subclass used in production) exposes a `.runtime`
-//  void* pointing to the underlying jsi::Runtime — no EXJavaScriptRuntime needed.
+//  Called from Swift via `try? appContext?.runtime`.
+//  EXJavaScriptRuntime (Swift name: JavaScriptRuntime) is still present in
+//  SDK 54's expo-modules-core and exposes `-get` to retrieve the raw
+//  jsi::Runtime pointer — no RCTBridge dependency needed.
 // =============================================================================
 @implementation ExpoImageToSvgJSIInstaller
 
-+ (void)installWithBridge:(RCTBridge *)bridge {
-    // RCTCxxBridge is the concrete subclass that exposes `.runtime`.
-    // The cast is safe: in all React Native builds (old arch and new arch
-    // bridged mode) the bridge object is always an RCTCxxBridge instance.
-    RCTCxxBridge *cxxBridge = (RCTCxxBridge *)bridge;
-    if (!cxxBridge || !cxxBridge.runtime) {
-        NSLog(@"[ExpoImageToSvg] Error: JSI Runtime is unavailable via bridge.");
-        return;
-    }
++ (void)install:(EXJavaScriptRuntime *)runtime {
+    // -get is a C++-only method on EXJavaScriptRuntime that returns jsi::Runtime*.
+    // It is available inside #ifdef __cplusplus blocks.
+    jsi::Runtime *jsiRuntimePtr = [runtime get];
+    if (!jsiRuntimePtr) return;
 
-    // cxxBridge.runtime is a void* pointing to a facebook::jsi::Runtime.
-    jsi::Runtime &rt = *(jsi::Runtime *)cxxBridge.runtime;
+    jsi::Runtime &rt = *jsiRuntimePtr;
 
     // ── nativeVectorize (single-pass) ────────────────────────────────────────
     auto vectorizeFunc = jsi::Function::createFromHostFunction(
