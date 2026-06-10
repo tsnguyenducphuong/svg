@@ -20,32 +20,50 @@ Pod::Spec.new do |s|
   s.swift_version  = '5.9'
 
   s.source         = { git: 'https://github.com/tsnguyenducphuong/svg' }
-  s.static_framework = true
+
+  # FIX 1: Remove s.static_framework = true
+  # Combining static_framework with DEFINES_MODULE = YES creates a contradictory
+  # configuration. A static framework doesn't vend a proper module map, so the
+  # Swift compiler sees a "hollow" AppContext type and can't resolve its members
+  # (including .runtime). CocoaPods handles linkage automatically via the
+  # :linkage setting in the app's Podfile; the pod itself should not force it.
 
   s.dependency 'ExpoModulesCore'
   s.dependency 'React-jsi'
 
   s.source_files = "**/*.{h,m,mm,swift}", "../cpp/**/*.{hpp,cpp}"
 
-  # Single pod_target_xcconfig block.
-  # NOTE: pod_target_xcconfig must only be assigned ONCE in Ruby — a second
-  # assignment silently overwrites the first (which is why DEFINES_MODULE was
-  # being lost in the original file). All settings are merged here.
+  # Single pod_target_xcconfig block — assigned exactly ONCE.
   #
-  # SWIFT_COMPILATION_MODE is intentionally removed:
-  #   - 'wholemodule' changes how Swift resolves cross-module types at compile
-  #     time and is known to break visibility of ExpoModulesCore members
-  #     (including AppContext.runtime) when the dependency is compiled with a
-  #     different mode. CocoaPods / Xcode manages this automatically.
+  # FIX 2: Remove DEFINES_MODULE = YES
+  # This is the primary cause of "AppContext has no member 'runtime'".
+  # DEFINES_MODULE changes how Swift resolves cross-module types at compile time.
+  # When your pod declares itself as a module, the Swift compiler builds a
+  # module boundary between it and ExpoModulesCore. AppContext's Swift members
+  # (which are @_spi or have access modifiers tied to module identity) become
+  # invisible across that boundary — the linker finds them but the type-checker
+  # doesn't. Removing this setting lets CocoaPods manage module exposure the
+  # standard way, which is what ExpoModulesCore expects its consumers to do.
+  #
+  # FIX 3: Add ExpoModulesCore to HEADER_SEARCH_PATHS
+  # Without this, the Swift compiler can't fully resolve AppContext's interface
+  # when compiling the mixed Swift/.mm source files in this pod.
+  #
+  # NOTE: SWIFT_COMPILATION_MODE is intentionally absent.
+  # 'wholemodule' is known to break visibility of ExpoModulesCore members
+  # (including AppContext.runtime) when the dependency uses a different mode.
+  # Xcode manages compilation mode automatically per build configuration.
   s.pod_target_xcconfig = {
-    'DEFINES_MODULE'              => 'YES',
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
     'CLANG_CXX_LIBRARY'           => 'libc++',
     'HEADER_SEARCH_PATHS'         => [
       '"$(PODS_TARGET_SRCROOT)/../cpp"',
       '"$(PODS_ROOT)/Headers/Public/React-Core"',
       '"$(PODS_ROOT)/Headers/Public/React-hermes"',
-      '"$(PODS_ROOT)/Headers/Public/React-jsi"'
+      '"$(PODS_ROOT)/Headers/Public/React-jsi"',
+      # FIX 3: ExpoModulesCore headers must be visible so the Swift compiler
+      # can fully resolve AppContext's interface in the mixed-source compilation.
+      '"$(PODS_ROOT)/Headers/Public/ExpoModulesCore"'
     ].join(' ')
   }
 end
