@@ -1,4 +1,4 @@
-import ExpoModulesCore
+@_spi(AppContext) import ExpoModulesCore
 import Foundation
 import WebKit
 

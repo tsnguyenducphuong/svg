@@ -439,13 +439,10 @@ jsi::Value vectorizeMultiPassJSI(
 // =============================================================================
 @implementation ExpoImageToSvgJSIInstaller
 
-+ (void)install:(EXJavaScriptRuntime *)runtime {
-    // -get is a C++-only method on EXJavaScriptRuntime that returns jsi::Runtime*.
-    // It is available inside #ifdef __cplusplus blocks.
-    jsi::Runtime *jsiRuntimePtr = [runtime get];
-    if (!jsiRuntimePtr) return;
-
-    jsi::Runtime &rt = *jsiRuntimePtr;
++ (void)install:(void *)runtimePointer { 
+    if (!runtimePointer) return;
+    // Cast raw pointer back to jsi::Runtime  
+    jsi::Runtime &rt = *reinterpret_cast<jsi::Runtime *>(runtimePointer); 
 
     // ── nativeVectorize (single-pass) ────────────────────────────────────────
     auto vectorizeFunc = jsi::Function::createFromHostFunction(

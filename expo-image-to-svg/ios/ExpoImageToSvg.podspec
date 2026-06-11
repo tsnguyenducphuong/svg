@@ -56,6 +56,8 @@ Pod::Spec.new do |s|
   s.pod_target_xcconfig = {
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
     'CLANG_CXX_LIBRARY'           => 'libc++',
+    # Enable C++ Interoperability for the Swift compiler
+    'OTHER_SWIFT_FLAGS' => '-cxx-interoperability-mode=default',
     'HEADER_SEARCH_PATHS'         => [
       '"$(PODS_TARGET_SRCROOT)/../cpp"',
       '"$(PODS_ROOT)/Headers/Public/React-Core"',
