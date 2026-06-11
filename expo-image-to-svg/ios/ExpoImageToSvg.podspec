@@ -55,9 +55,7 @@ Pod::Spec.new do |s|
   # Xcode manages compilation mode automatically per build configuration.
   s.pod_target_xcconfig = {
     'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
-    'CLANG_CXX_LIBRARY'           => 'libc++',
-    # Enable C++ Interoperability for the Swift compiler
-    'OTHER_SWIFT_FLAGS' => '-cxx-interoperability-mode=default',
+    'CLANG_CXX_LIBRARY'           => 'libc++', 
     'HEADER_SEARCH_PATHS'         => [
       '"$(PODS_TARGET_SRCROOT)/../cpp"',
       '"$(PODS_ROOT)/Headers/Public/React-Core"',
