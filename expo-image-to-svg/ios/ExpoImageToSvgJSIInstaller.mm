@@ -439,7 +439,7 @@ jsi::Value vectorizeMultiPassJSI(
 // =============================================================================
 @implementation ExpoImageToSvgJSIInstaller
 
-+ (void)install:(id)runtimeObj { 
++ (void)install:(void *)runtimeObj { 
     if (!runtimeObj) return;
     // Cast raw pointer back to jsi::Runtime   
     EXJavaScriptRuntime *runtime = (EXJavaScriptRuntime *)runtimeObj;
