@@ -5,7 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface ExpoImageToSvgJSIInstaller : NSObject
 
-+ (void)install:(EXJavaScriptRuntime *)runtime;
++ (void)install:(id)runtime;
 
 @end
 
